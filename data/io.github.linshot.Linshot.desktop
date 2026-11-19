@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Name=Linshot
+GenericName=Screenshot Tool
+Comment=Capture, annotate and share screenshots
+Exec=linshot
+Icon=linshot
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;screen;snip;annotate;print;
+StartupNotify=false
+DBusActivatable=false
+Actions=Region;Window;Fullscreen;
+
+[Desktop Action Region]
+Name=Capture Region
+Exec=linshot region
+
+[Desktop Action Window]
+Name=Capture Window
+Exec=linshot window
+
+[Desktop Action Fullscreen]
+Name=Capture Full Screen
+Exec=linshot full

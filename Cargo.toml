@@ -1,0 +1,26 @@
+[package]
+name = "linshot"
+version = "0.1.0"
+edition = "2021"
+description = "Screenshot and annotation tool for Linux (X11 and Wayland)"
+license = "GPL-3.0-or-later"
+authors = ["Aditya Telange <21258296+adityatelange@users.noreply.github.com>"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+async-channel = "2"
+ksni = "0.2"
+x11rb = "0.13"
+zbus = "4"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
