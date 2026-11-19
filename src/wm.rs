@@ -65,11 +65,12 @@ fn wayfire_call(method: &str) -> Option<Value> {
     let mut s = std::os::unix::net::UnixStream::connect(path).ok()?;
     s.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
     let msg = serde_json::to_vec(&json!({ "method": method, "data": {} })).ok()?;
-    s.write_all(&(msg.len() as u32).to_le_bytes()).ok()?;
+    // the length header is in host byte order
+    s.write_all(&(msg.len() as u32).to_ne_bytes()).ok()?;
     s.write_all(&msg).ok()?;
     let mut len = [0u8; 4];
     s.read_exact(&mut len).ok()?;
-    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+    let mut buf = vec![0u8; u32::from_ne_bytes(len) as usize];
     s.read_exact(&mut buf).ok()?;
     let v: Value = serde_json::from_slice(&buf).ok()?;
     if v.get("error").is_some() {

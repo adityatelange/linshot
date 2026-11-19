@@ -78,10 +78,18 @@ fn config_path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Config {
-        std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let p = config_path();
+        let Ok(s) = std::fs::read_to_string(&p) else { return Config::default() };
+        match serde_json::from_str(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                // keep the broken file for the user instead of overwriting it on the next save
+                let bak = p.with_extension("json.bad");
+                eprintln!("linshot: {} is invalid ({e}); using defaults, old file kept as {}", p.display(), bak.display());
+                let _ = std::fs::rename(&p, &bak);
+                Config::default()
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -90,7 +98,9 @@ impl Config {
             let _ = std::fs::create_dir_all(d);
         }
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(p, s);
+            if let Err(e) = write_atomic(&p, s.as_bytes(), true) {
+                eprintln!("linshot: could not save {}: {e}", p.display());
+            }
         }
     }
 
@@ -117,6 +127,28 @@ impl Config {
         }
         path
     }
+}
+
+/// Writes a file so that readers (and a crash or full disk midway) only ever
+/// see the old or the complete new content: temp file in the same folder,
+/// then rename over the target. `sync` flushes to disk before the rename.
+pub fn write_atomic(path: &std::path::Path, data: &[u8], sync: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+    let r = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        if sync {
+            f.sync_all()?;
+        }
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 pub fn shellexpand(s: &str) -> String {
@@ -152,5 +184,38 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_replaces_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("linshot-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        write_atomic(&p, b"one", true).unwrap();
+        write_atomic(&p, b"two", false).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        // only the target is left behind
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // unwritable target folder: error, no stray temp file
+        assert!(write_atomic(&dir.join("missing").join("x.png"), b"x", false).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_roundtrip_and_partial() {
+        let c = Config::default();
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.filename_pattern, c.filename_pattern);
+        // missing fields fall back to defaults
+        let partial: Config = serde_json::from_str(r#"{"jpeg_quality": 50}"#).unwrap();
+        assert_eq!(partial.jpeg_quality, 50);
+        assert!(partial.notifications);
     }
 }

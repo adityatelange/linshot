@@ -9,8 +9,17 @@ use std::process::Command;
 /// Sends `true` when the desktop prefers dark, on startup and on every change.
 pub fn spawn_watcher(tx: async_channel::Sender<bool>) {
     std::thread::spawn(move || {
-        if watch_portal(&tx).is_err() {
-            let _ = tx.send_blocking(gsettings_dark());
+        // reconnect a few times if the portal goes away (e.g. it is restarted)
+        for attempt in 0..10 {
+            let r = watch_portal(&tx);
+            if tx.is_closed() {
+                return;
+            }
+            if r.is_err() && attempt == 0 {
+                let _ = tx.send_blocking(gsettings_dark());
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
     });
 }

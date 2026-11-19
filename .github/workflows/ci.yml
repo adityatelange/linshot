@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    # oldest (GTK 4.6) and current (GTK 4.14) supported Ubuntu releases
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked
+      - run: cargo test --locked

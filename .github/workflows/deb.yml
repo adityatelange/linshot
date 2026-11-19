@@ -7,16 +7,32 @@ on:
 
 jobs:
   deb:
+    # Built on the oldest supported release: the package's glibc/GTK
+    # requirements come from the build host, and the Ubuntu 22.04 build
+    # (glibc 2.35, GTK 4.6) installs on Ubuntu 22.04+, Debian 12+, Mint 21+
+    # and other derivatives.
     strategy:
+      fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-22.04
+            distro: ubuntu22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            distro: ubuntu22.04
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
       - run: packaging/build-deb.sh
+      - name: Check the package installs
+        run: |
+          sudo apt-get install -y ./dist/*.deb
+          linshot --version
       - uses: actions/upload-artifact@v4
         with:
-          name: linshot-${{ matrix.runner }}
+          name: linshot-${{ matrix.distro }}-${{ matrix.arch }}
           path: dist/*.deb

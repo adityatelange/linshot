@@ -2,11 +2,14 @@
 // Copyright (C) 2026 Aditya Telange
 
 mod capture;
+mod compat;
 mod config;
 mod editor;
 mod hotkeys;
 mod imageops;
 mod overlay;
+mod png;
+mod session;
 mod settings;
 mod shortcuts;
 mod style;
@@ -25,6 +28,14 @@ use std::rc::Rc;
 
 pub const APP_ID: &str = "io.github.linshot.Linshot";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Prints how long a step took when LINSHOT_TRACE is set (performance debugging).
+pub fn trace(what: &str, since: std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("LINSHOT_TRACE").is_some()) {
+        eprintln!("linshot: [trace] {what}: {:.1} ms", since.elapsed().as_secs_f64() * 1000.0);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -71,7 +82,7 @@ pub struct Ctx {
     system_dark: Cell<bool>,
     control: RefCell<Option<gtk::ApplicationWindow>>,
     watchers: RefCell<Vec<gio::FileMonitor>>,
-    tray: RefCell<Option<ksni::Handle<tray::Tray>>>,
+    tray: RefCell<Option<tray::TrayHandle>>,
 }
 
 impl Ctx {
@@ -89,7 +100,7 @@ impl Ctx {
 
     pub fn error(&self, parent: Option<&gtk::Window>, msg: &str) {
         eprintln!("linshot: {msg}");
-        gtk::AlertDialog::builder().modal(true).message("Linshot").detail(msg).build().show(parent);
+        compat::alert(parent, "Linshot", msg);
     }
 }
 
@@ -183,6 +194,7 @@ fn parse(args: &[String], cwd: &Path) -> Result<Vec<Cmd>, String> {
 }
 
 fn main() -> glib::ExitCode {
+    session::init();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
@@ -196,6 +208,7 @@ fn main() -> glib::ExitCode {
         eprintln!("linshot: {e}");
         return glib::ExitCode::from(2);
     }
+    install_panic_log();
 
     let app = gtk::Application::builder()
         .application_id(APP_ID)
@@ -206,16 +219,20 @@ fn main() -> glib::ExitCode {
         let args: Vec<String> = cl.arguments().iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
         let cwd = cl.cwd().unwrap_or_else(|| PathBuf::from("."));
         match parse(&args, &cwd) {
-            Ok(cmds) => {
-                CTX.with(|c| {
-                    if let Some(ctx) = c.get() {
-                        for cmd in cmds {
-                            let _ = ctx.tx.send_blocking(cmd);
-                        }
+            Ok(cmds) => CTX.with(|c| {
+                let Some(ctx) = c.get() else { return 0 };
+                let mut status = 0;
+                for cmd in cmds {
+                    if matches!(cmd, Cmd::Capture(_)) && ctx.busy.get() {
+                        // tell the caller (e.g. a script using -o) instead of failing silently
+                        printerr(cl, "linshot: another capture is in progress, request ignored\n");
+                        status = 1;
+                        continue;
                     }
-                });
-                0
-            }
+                    let _ = ctx.tx.send_blocking(cmd);
+                }
+                status
+            }),
             Err(e) => {
                 eprintln!("linshot: {e}");
                 2
@@ -223,6 +240,43 @@ fn main() -> glib::ExitCode {
         }
     });
     app.run_with_args(&args)
+}
+
+/// Linshot usually runs in the background (autostart, tray) where stderr is
+/// lost. A panic in a GTK callback aborts the process, so record it in
+/// ~/.local/state/linshot/crash.log (newest last, capped) before that happens.
+/// Panics in helper threads only end that thread but are logged the same way.
+fn install_panic_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let Some(dir) = dirs::state_dir().or_else(dirs::cache_dir).map(|d| d.join("linshot")) else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("crash.log");
+        // keep the log small: start over once it passes 256 KiB
+        let append = std::fs::metadata(&path).map(|m| m.len() < 256 * 1024).unwrap_or(false);
+        let file = std::fs::OpenOptions::new().create(true).append(append).write(true).truncate(!append).open(&path);
+        if let Ok(mut f) = file {
+            use std::io::Write;
+            let thread = std::thread::current();
+            let _ = writeln!(
+                f,
+                "--- {} linshot {VERSION}, thread '{}'\n{info}\n{}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                thread.name().unwrap_or("?"),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }));
+}
+
+/// Prints on the stderr of the process that sent this command line.
+fn printerr(cl: &gio::ApplicationCommandLine, msg: &str) {
+    use glib::translate::ToGlibPtr;
+    let Ok(msg) = std::ffi::CString::new(msg) else { return };
+    // SAFETY: valid command line object; "%s" with one NUL-terminated string
+    // (printerr_literal needs GLib 2.80)
+    unsafe { gio::ffi::g_application_command_line_printerr(cl.to_glib_none().0, c"%s".as_ptr(), msg.as_ptr()) }
 }
 
 fn startup(app: &gtk::Application) {
@@ -264,7 +318,7 @@ fn startup(app: &gtk::Application) {
                 apply_theme(&ctx);
                 let panel_dark = dark || tray::panel_always_dark();
                 if let Some(h) = ctx.tray.borrow().as_ref() {
-                    h.update(|t| t.dark_panel = panel_dark);
+                    h.set_dark_panel(panel_dark);
                 }
             }
         });
@@ -388,26 +442,27 @@ fn offer_shortcuts(ctx: &Rc<Ctx>) {
         c.shortcuts_prompted = true;
         c.save();
     }
-    let dlg = gtk::AlertDialog::builder()
-        .modal(true)
-        .message("Use the Print key for Linshot?")
-        .detail(format!(
-            "Linshot will add these shortcuts to {}'s keyboard settings and take Print away from the built-in screenshot tool:\n\n\
-             Print — capture region\nAlt+Print — capture window\nCtrl+Print — capture full screen\nShift+Print — capture last region\n\n\
-             You can undo this in Linshot's Preferences.",
-            shortcuts::desktop_name()
-        ))
-        .buttons(["Set up shortcuts", "Not now"])
-        .default_button(0)
-        .cancel_button(1)
-        .build();
+    let detail = format!(
+        "Linshot will add these shortcuts to {}'s keyboard settings and take Print away from the built-in screenshot tool:\n\n\
+         Print — capture region\nAlt+Print — capture window\nCtrl+Print — capture full screen\nShift+Print — capture last region\n\n\
+         You can undo this in Linshot's Preferences.",
+        shortcuts::desktop_name()
+    );
     let ctx2 = ctx.clone();
     let parent = ctx.app.active_window();
-    dlg.choose(parent.as_ref(), gio::Cancellable::NONE, move |r| {
-        if r == Ok(0) {
-            setup_shortcuts(&ctx2, None);
-        }
-    });
+    compat::choose(
+        parent.as_ref(),
+        "Use the Print key for Linshot?",
+        &detail,
+        &["Set up shortcuts", "Not now"],
+        0,
+        1,
+        move |r| {
+            if r == 0 {
+                setup_shortcuts(&ctx2, None);
+            }
+        },
+    );
 }
 
 /// Applies the configured appearance: follow the desktop, or force light/dark.
@@ -447,25 +502,37 @@ fn handle(ctx: &Rc<Ctx>, cmd: Cmd) {
 }
 
 fn open_dialog(ctx: &Rc<Ctx>) {
-    let f = gtk::FileFilter::new();
-    f.set_name(Some("Images"));
-    f.add_pixbuf_formats();
-    let filters = gio::ListStore::new::<gtk::FileFilter>();
-    filters.append(&f);
-    let dlg = gtk::FileDialog::builder().title("Open image").filters(&filters).modal(true).build();
     let ctx2 = ctx.clone();
     let parent = ctx.app.active_window();
-    dlg.open(parent.as_ref(), gio::Cancellable::NONE, move |r| {
-        if let Ok(Some(p)) = r.map(|f| f.path()) {
+    let filters = [compat::Filter { name: "Images", patterns: &[], pixbuf_formats: true }];
+    compat::open_file(parent.as_ref(), "Open image", &filters, move |p| {
+        if let Some(p) = p {
             let _ = ctx2.tx.send_blocking(Cmd::OpenFile(p));
         }
     });
 }
 
-fn capture(ctx: &Rc<Ctx>, req: Req) {
-    if ctx.busy.replace(true) {
-        return;
+/// Marks a capture as running; dropping it (on any path, including the
+/// selection overlay going away without an answer) allows the next one.
+struct Busy(Rc<Ctx>);
+
+impl Busy {
+    fn acquire(ctx: &Rc<Ctx>) -> Option<Busy> {
+        (!ctx.busy.replace(true)).then(|| Busy(ctx.clone()))
     }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.busy.set(false);
+    }
+}
+
+fn capture(ctx: &Rc<Ctx>, req: Req) {
+    let Some(busy) = Busy::acquire(ctx) else {
+        eprintln!("linshot: a capture is already in progress, ignoring {:?}", req.mode);
+        return;
+    };
     if let Some(w) = ctx.control.borrow().as_ref() {
         w.set_visible(false);
     }
@@ -487,10 +554,12 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             let interactive = want_picker && wl.is_none();
             let mut active = if want_active { capture::x11_active_window().map(|r| Area::Px(r)) } else { None };
             // no interactive portal (e.g. wlroots): grab everything and let the user select
+            let t = std::time::Instant::now();
             let (g, interactive) = match capture::grab(interactive, cursor) {
                 Err(e) if interactive && !e.contains("cancelled") => (capture::grab(false, cursor), false),
                 r => (r, interactive),
             };
+            trace("grab", t);
             let mut wins: Vec<Area> = if want_windows {
                 capture::x11_windows().into_iter().map(Area::Px).collect()
             } else {
@@ -505,38 +574,47 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             let _ = tx.send_blocking((g, wins, active, interactive));
         });
         let Ok((g, wins, active, interactive)) = rx.recv().await else {
-            ctx.busy.set(false);
+            ctx.error(None, "Screenshot failed: the capture thread stopped unexpectedly");
             return;
         };
+        let t = std::time::Instant::now();
         let (img, ptr): (ImageSurface, Ptr) = match g.and_then(|(g, c)| imageops::surface_from_grab(g).map(|s| (s, c))) {
             Ok((i, c)) => (i, c.and_then(|c| {
                 ImageSurface::create_for_data(c.data, cairo::Format::ARgb32, c.w, c.h, c.w * 4).ok().map(|s| (s, c.x, c.y))
             })),
             Err(e) => {
-                ctx.busy.set(false);
+                drop(busy);
                 if !e.contains("cancelled") {
                     ctx.error(None, &format!("Screenshot failed: {e}"));
                 }
                 return;
             }
         };
+        trace("surface from grab", t);
         let fits = |r: [i32; 4]| r[2] > 0 && r[3] > 0 && r[0] + r[2] <= img.width() && r[1] + r[3] <= img.height();
         let to_px = |a: &Area| a.to_px(img.width(), img.height());
         let wins: Vec<(i32, i32, i32, i32)> = wins.iter().map(to_px).collect();
         let active = active.as_ref().map(to_px);
         // no active-window info: choose the window in our overlay instead
         let mode = if req.mode == Mode::Active && active.is_none() && !interactive { Mode::Window } else { req.mode };
-        match mode {
-            Mode::Full => deliver(&ctx, img, &req, ptr_at(&ptr, 0, 0)),
-            _ if interactive => deliver(&ctx, img, &req, ptr_at(&ptr, 0, 0)),
-            Mode::Active => {
-                let (x, y, w, h) = active.unwrap();
+        let last = ctx.cfg.borrow().last_region.filter(|r| fits(*r));
+        match (mode, active, last) {
+            (Mode::Full, ..) => {
+                drop(busy);
+                deliver(&ctx, Ok(img), &req, ptr_at(&ptr, 0, 0))
+            }
+            _ if interactive => {
+                drop(busy);
+                deliver(&ctx, Ok(img), &req, ptr_at(&ptr, 0, 0))
+            }
+            (Mode::Active, Some((x, y, w, h)), _) => {
+                drop(busy);
                 let (x2, y2) = ((x + w).min(img.width()), (y + h).min(img.height()));
-                let (x, y) = (x.max(0), y.max(0));
+                let (x, y) = (x.clamp(0, img.width() - 1), y.clamp(0, img.height() - 1));
                 deliver(&ctx, imageops::crop(&img, x, y, (x2 - x).max(1), (y2 - y).max(1)), &req, ptr_at(&ptr, x, y))
             }
-            Mode::Last if ctx.cfg.borrow().last_region.map(fits).unwrap_or(false) => {
-                let r = ctx.cfg.borrow().last_region.unwrap();
+            (Mode::Last, _, Some(r)) => {
+                drop(busy);
                 deliver(&ctx, imageops::crop(&img, r[0], r[1], r[2], r[3]), &req, ptr_at(&ptr, r[0], r[1]))
             }
             _ => {
@@ -549,8 +627,9 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
                     wins,
                     mode == Mode::Window,
                     mag,
-                    Box::new(move |r| match r {
-                        Some((x, y, w, h)) => {
+                    Box::new(move |r| {
+                        drop(busy);
+                        if let Some((x, y, w, h)) = r {
                             {
                                 let mut c = ctx2.cfg.borrow_mut();
                                 c.last_region = Some([x, y, w, h]);
@@ -558,7 +637,6 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
                             }
                             deliver(&ctx2, imageops::crop(&full, x, y, w, h), &req, ptr_at(&ptr, x, y))
                         }
-                        None => ctx2.busy.set(false),
                     }),
                 );
             }
@@ -603,8 +681,11 @@ fn ptr_at(p: &Ptr, x: i32, y: i32) -> Option<(ImageSurface, f64, f64)> {
     p.as_ref().map(|(s, px, py)| (s.clone(), (px - x) as f64, (py - y) as f64))
 }
 
-fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req, ptr: Option<(ImageSurface, f64, f64)>) {
-    ctx.busy.set(false);
+fn deliver(ctx: &Rc<Ctx>, img: Result<ImageSurface, String>, req: &Req, ptr: Option<(ImageSurface, f64, f64)>) {
+    let img = match img {
+        Ok(i) => i,
+        Err(e) => return ctx.error(None, &format!("Screenshot failed: {e}")),
+    };
     // keep the pointer only if it is inside the captured area
     let ptr = ptr.filter(|(s, x, y)| {
         *x + (s.width() as f64) > 0.0 && *y + (s.height() as f64) > 0.0 && *x < img.width() as f64 && *y < img.height() as f64
@@ -622,7 +703,12 @@ fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req, ptr: Option<(ImageSurfac
         }
     }
     let q = ctx.cfg.borrow().jpeg_quality;
-    let save = |path: PathBuf| match imageops::save(&img, &path, q) {
+    let save = |path: PathBuf| match {
+        let t = std::time::Instant::now();
+        let r = imageops::save(&img, &path, q);
+        trace("save", t);
+        r
+    } {
         Ok(()) => {
             ctx.notify("Screenshot saved", &path.display().to_string(), Some(&path));
             true
@@ -656,6 +742,67 @@ fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req, ptr: Option<(ImageSurfac
     }
 }
 
+/// Theme-coloured capture-mode glyphs for the launcher (icon themes differ
+/// too much; Adwaita's "selection-mode" is a check mark, for instance).
+fn mode_glyph(mode: Mode) -> gtk::DrawingArea {
+    let a = gtk::DrawingArea::new();
+    a.set_content_width(30);
+    a.set_content_height(30);
+    a.set_can_target(false);
+    a.set_draw_func(move |w, cr, width, _| {
+        let c = crate::compat::fg_color(w);
+        let (r, g, b) = (c.red() as f64, c.green() as f64, c.blue() as f64);
+        cr.scale(width as f64 / 24.0, width as f64 / 24.0);
+        cr.set_source_rgb(r, g, b);
+        cr.set_line_width(1.8);
+        cr.set_line_cap(cairo::LineCap::Round);
+        cr.set_line_join(cairo::LineJoin::Round);
+        match mode {
+            Mode::Region | Mode::Last => {
+                // dashed selection with corner handles
+                cr.set_dash(&[2.2, 2.6], 0.0);
+                cr.rectangle(4.0, 5.0, 16.0, 13.0);
+                cr.stroke().ok();
+                cr.set_dash(&[], 0.0);
+                for (x, y) in [(4.0, 5.0), (20.0, 5.0), (4.0, 18.0), (20.0, 18.0)] {
+                    cr.rectangle(x - 1.6, y - 1.6, 3.2, 3.2);
+                    cr.fill().ok();
+                }
+                if mode == Mode::Last {
+                    // "again" arrow inside the selection
+                    cr.arc(12.0, 11.5, 3.6, 0.6, std::f64::consts::TAU - 0.2);
+                    cr.stroke().ok();
+                    cr.move_to(15.9, 8.2);
+                    cr.line_to(15.6, 10.9);
+                    cr.line_to(13.0, 10.4);
+                    cr.stroke().ok();
+                }
+            }
+            Mode::Window | Mode::Active => {
+                overlay::rounded(cr, 3.0, 4.5, 18.0, 15.0, 2.5);
+                cr.stroke().ok();
+                cr.move_to(3.0, 8.8);
+                cr.line_to(21.0, 8.8);
+                cr.stroke().ok();
+                for x in [6.0, 8.6] {
+                    cr.arc(x, 6.7, 0.8, 0.0, std::f64::consts::TAU);
+                    cr.fill().ok();
+                }
+            }
+            Mode::Full => {
+                overlay::rounded(cr, 2.5, 4.0, 19.0, 13.0, 2.0);
+                cr.stroke().ok();
+                cr.move_to(9.0, 20.5);
+                cr.line_to(15.0, 20.5);
+                cr.move_to(12.0, 17.0);
+                cr.line_to(12.0, 20.5);
+                cr.stroke().ok();
+            }
+        }
+    });
+    a
+}
+
 fn show_control(ctx: &Rc<Ctx>) {
     if let Some(w) = ctx.control.borrow().as_ref() {
         w.present();
@@ -666,31 +813,37 @@ fn show_control(ctx: &Rc<Ctx>) {
         .title("Linshot")
         .resizable(false)
         .build();
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    for m in [&root] {
-        m.set_margin_top(16);
-        m.set_margin_bottom(16);
-        m.set_margin_start(16);
-        m.set_margin_end(16);
-    }
-    let grid = gtk::Grid::builder().row_spacing(8).column_spacing(8).column_homogeneous(true).build();
+    win.add_css_class("ls-launcher");
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+    let grid = gtk::Grid::builder().row_spacing(10).column_spacing(10).column_homogeneous(true).build();
     let delay = gtk::SpinButton::with_range(0.0, 60.0, 1.0);
+    delay.set_numeric(true);
+    delay.set_valign(gtk::Align::Center);
     let x11 = capture::is_x11();
-    let entries: [(&str, &str, &str, Mode); 4] = [
-        ("Region", "selection-mode-symbolic", if x11 { "Print" } else { "" }, Mode::Region),
-        ("Window", "window-new-symbolic", if x11 { "Alt+Print" } else { "" }, Mode::Window),
-        ("Full screen", "view-fullscreen-symbolic", if x11 { "Ctrl+Print" } else { "" }, Mode::Full),
-        ("Last region", "view-refresh-symbolic", if x11 { "Shift+Print" } else { "" }, Mode::Last),
+    let entries: [(&str, &str, Mode); 4] = [
+        ("Region", if x11 { "Print" } else { "" }, Mode::Region),
+        ("Window", if x11 { "Alt+Print" } else { "" }, Mode::Window),
+        ("Full screen", if x11 { "Ctrl+Print" } else { "" }, Mode::Full),
+        ("Last region", if x11 { "Shift+Print" } else { "" }, Mode::Last),
     ];
-    for (i, (label, icon, key, mode)) in entries.into_iter().enumerate() {
+    for (i, (label, key, mode)) in entries.into_iter().enumerate() {
         let b = gtk::Button::new();
-        let bx = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        bx.append(&gtk::Image::builder().icon_name(icon).pixel_size(24).build());
-        bx.append(&gtk::Label::new(Some(label)));
+        let bx = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let icon = mode_glyph(mode);
+        icon.add_css_class("ls-mode-icon");
+        icon.set_halign(gtk::Align::Center);
+        icon.set_margin_bottom(6);
+        bx.append(&icon);
+        let l = gtk::Label::new(Some(label));
+        l.add_css_class("ls-mode-name");
+        bx.append(&l);
         if !key.is_empty() {
             let k = gtk::Label::new(Some(key));
-            k.add_css_class("dim-label");
-            k.add_css_class("caption");
+            k.add_css_class("ls-mode-key");
             bx.append(&k);
         }
         b.set_child(Some(&bx));
@@ -704,14 +857,21 @@ fn show_control(ctx: &Rc<Ctx>) {
     }
     root.append(&grid);
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.append(&gtk::Label::new(Some("Delay (s)")));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let dl = gtk::Label::new(Some("Delay"));
+    dl.add_css_class("ls-launcher-cap");
+    row.append(&dl);
     row.append(&delay);
+    let secs = gtk::Label::new(Some("s"));
+    secs.add_css_class("ls-launcher-cap");
+    row.append(&secs);
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     row.append(&spacer);
     for (label, cmd) in [("Open image…", Cmd::OpenDialog), ("Folder", Cmd::OpenFolder), ("Preferences", Cmd::Settings), ("Quit", Cmd::Quit)] {
         let b = gtk::Button::with_label(label);
+        b.add_css_class(if matches!(cmd, Cmd::Quit) { "flat" } else { "ls-soft" });
+        b.set_valign(gtk::Align::Center);
         let tx = ctx.tx.clone();
         b.connect_clicked(move |_| {
             let _ = tx.send_blocking(cmd.clone());
@@ -720,15 +880,21 @@ fn show_control(ctx: &Rc<Ctx>) {
     }
     root.append(&row);
 
-    let hint = gtk::Label::new(Some(if x11 {
-        "Linshot keeps running in the background (tray icon) so the Print-key shortcuts and the clipboard keep working."
+    // without a panel that shows tray icons, say how to get back here
+    let (icon, reopen) = if tray::host_available() {
+        (" (tray icon)", "")
     } else {
-        "Wayland: add keyboard shortcuts in your desktop settings, e.g.  Print → linshot region,  Alt+Print → linshot window,  Ctrl+Print → linshot full.  Linshot keeps running in the background."
+        ("", "  Start Linshot from the application menu to reopen this window.")
+    };
+    let hint = gtk::Label::new(Some(&if x11 {
+        format!("Linshot keeps running in the background{icon} so the Print-key shortcuts and the clipboard keep working.{reopen}")
+    } else {
+        format!("Wayland: add keyboard shortcuts in your desktop settings, e.g.  Print → linshot region,  Alt+Print → linshot window,  Ctrl+Print → linshot full.  Linshot keeps running in the background{icon}.{reopen}")
     }));
     hint.set_wrap(true);
     hint.set_max_width_chars(60);
     hint.set_xalign(0.0);
-    hint.add_css_class("dim-label");
+    hint.add_css_class("ls-launcher-hint");
     root.append(&hint);
     win.set_child(Some(&root));
     win.connect_close_request(|w| {

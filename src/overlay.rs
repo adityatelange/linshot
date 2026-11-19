@@ -57,6 +57,8 @@ pub fn monitors() -> Vec<(gdk::Monitor, R)> {
 
 struct State {
     img: ImageSurface,
+    /// `img` with the dimming already applied (see `dimmed`)
+    dim: Option<ImageSurface>,
     virt: R,
     sx: f64,
     sy: f64,
@@ -79,11 +81,19 @@ impl State {
     fn hover_window(&self) -> Option<R> {
         self.windows.iter().find(|w| w.contains(self.cursor)).map(|w| w.intersect(&self.virt))
     }
+    /// Window mode only means something when there are windows to pick.
+    fn picking_windows(&self) -> bool {
+        self.window_mode && !self.windows.is_empty()
+    }
+    /// What a release / Enter would capture right now (and what is drawn).
     fn active(&self) -> Option<R> {
+        if self.picking_windows() {
+            return if self.has_cursor { self.hover_window() } else { None };
+        }
         if let Some(s) = self.selection() {
             return Some(s);
         }
-        if self.start.is_none() && (self.window_mode || !self.windows.is_empty()) && self.has_cursor {
+        if self.start.is_none() && !self.windows.is_empty() && self.has_cursor {
             return self.hover_window();
         }
         None
@@ -124,8 +134,10 @@ pub fn select(
         .iter()
         .map(|&(x, y, w, h)| R { x: virt.x + x as f64 / sx, y: virt.y + y as f64 / sy, w: w as f64 / sx, h: h as f64 / sy })
         .collect();
+    let dim = dimmed(&img);
     let st = Rc::new(RefCell::new(State {
         img,
+        dim,
         virt,
         sx,
         sy,
@@ -146,10 +158,14 @@ pub fn select(
         let areas = areas.clone();
         move || areas.borrow().iter().for_each(|a| a.queue_draw())
     };
+    // monitor-list watch, disconnected when the overlay is done
+    let watch: Rc<RefCell<Option<(gtk::gio::ListModel, glib::SignalHandlerId)>>> = Rc::new(RefCell::new(None));
     let finish = {
         let st = st.clone();
         let wins = wins.clone();
+        let areas = areas.clone();
         let done = done.clone();
+        let watch = watch.clone();
         Rc::new(move |result: Option<R>| {
             let px = {
                 let mut s = st.borrow_mut();
@@ -159,14 +175,23 @@ pub fn select(
                 s.done = true;
                 result.map(|r| s.to_px(&r)).filter(|r| r.2 > 0 && r.3 > 0)
             };
-            for w in wins.borrow().iter() {
+            let to_close = wins.borrow().clone();
+            for w in to_close {
                 w.close();
             }
             let done = done.clone();
+            let (wins, areas, watch) = (wins.clone(), areas.clone(), watch.clone());
             // let the compositor remove the overlay before anything else happens
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 if let Some(f) = done.borrow_mut().take() {
                     f(px);
+                }
+                // the widgets' handlers hold these lists: clearing them breaks the
+                // reference cycle so the windows and the screenshot are freed
+                wins.borrow_mut().clear();
+                areas.borrow_mut().clear();
+                if let Some((list, id)) = watch.borrow_mut().take() {
+                    list.disconnect(id);
                 }
             });
         })
@@ -179,6 +204,16 @@ pub fn select(
         }
         return;
     }
+    if let Some(d) = gdk::Display::default() {
+        // a monitor added or removed while selecting: the frozen screenshot no
+        // longer matches the screen layout (and a window may have lost its
+        // monitor), so cancel rather than crop the wrong area
+        let list = d.monitors();
+        let finish = finish.clone();
+        let id = list.connect_items_changed(move |_, _, _, _| finish(None));
+        *watch.borrow_mut() = Some((list, id));
+    }
+
     for (mon, g) in mons.iter().cloned() {
         let win = gtk::Window::builder().application(app).decorated(false).title("Linshot selection").build();
         win.add_css_class("linshot-overlay");
@@ -235,21 +270,14 @@ pub fn select(
             let finish = finish.clone();
             let redraw = redraw.clone();
             drag.connect_drag_end(move |_, _, _| {
-                let (sel, hover, wm) = {
-                    let s = st.borrow();
-                    (s.selection(), s.hover_window(), s.window_mode)
-                };
-                match sel {
-                    Some(r) if !wm => finish(Some(r)),
-                    _ => {
-                        if let Some(w) = hover {
-                            finish(Some(w));
-                        } else if let Some(r) = sel {
-                            finish(Some(r));
-                        } else {
-                            st.borrow_mut().start = None;
-                            redraw();
-                        }
+                // capture exactly what is highlighted (Space may have
+                // switched modes in the middle of the drag)
+                let a = st.borrow().active();
+                match a {
+                    Some(r) => finish(Some(r)),
+                    None => {
+                        st.borrow_mut().start = None;
+                        redraw();
                     }
                 }
             });
@@ -291,6 +319,20 @@ pub fn select(
         }
         win.add_controller(keys);
 
+        {
+            // closed by the window manager (Alt+F4, ...): same as cancelling
+            let st = st.clone();
+            let finish = finish.clone();
+            win.connect_close_request(move |_| {
+                if st.borrow().done {
+                    glib::Propagation::Proceed
+                } else {
+                    finish(None); // closes all overlay windows, this one included
+                    glib::Propagation::Stop
+                }
+            });
+        }
+
         win.fullscreen_on_monitor(&mon);
         win.present();
         area.grab_focus();
@@ -299,32 +341,60 @@ pub fn select(
     }
 }
 
+const DIM: f64 = 0.45;
+
+/// The screenshot darkened like the area outside the selection. Painting
+/// this once per frame (plus the undimmed selection) instead of the image
+/// and then a translucent full-screen fill saves one full-screen blend on
+/// every pointer move, which matters on large or several monitors.
+fn dimmed(img: &ImageSurface) -> Option<ImageSurface> {
+    let out = ImageSurface::create(cairo::Format::ARgb32, img.width(), img.height()).ok()?;
+    let cr = cairo::Context::new(&out).ok()?;
+    cr.set_source_surface(img, 0.0, 0.0).ok()?;
+    cr.paint().ok()?;
+    cr.set_source_rgba(0.0, 0.0, 0.0, DIM);
+    cr.paint().ok()?;
+    drop(cr);
+    Some(out)
+}
+
 fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
-    // frozen screenshot
-    cr.save().ok();
-    cr.translate(s.virt.x - g.x, s.virt.y - g.y);
-    cr.scale(1.0 / s.sx, 1.0 / s.sy);
-    cr.set_source_surface(&s.img, 0.0, 0.0).ok();
-    cr.paint().ok();
-    cr.restore().ok();
-
     let active = s.active().map(|r| R { x: r.x - g.x, y: r.y - g.y, ..r });
-
-    // dim everything outside the selection
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
-    cr.rectangle(0.0, 0.0, w, h);
-    if let Some(r) = active {
-        cr.rectangle(r.x, r.y, r.w, r.h);
-        cr.set_fill_rule(cairo::FillRule::EvenOdd);
+    let paint_img = |img: &ImageSurface| {
+        cr.save().ok();
+        cr.translate(s.virt.x - g.x, s.virt.y - g.y);
+        cr.scale(1.0 / s.sx, 1.0 / s.sy);
+        cr.set_source_surface(img, 0.0, 0.0).ok();
+        cr.paint().ok();
+        cr.restore().ok();
+    };
+    if let Some(dim) = &s.dim {
+        // frozen screenshot, dimmed outside the selection
+        paint_img(dim);
+        if let Some(r) = active {
+            cr.save().ok();
+            cr.rectangle(r.x, r.y, r.w, r.h);
+            cr.clip();
+            paint_img(&s.img);
+            cr.restore().ok();
+        }
+    } else {
+        paint_img(&s.img);
+        cr.set_source_rgba(0.0, 0.0, 0.0, DIM);
+        cr.rectangle(0.0, 0.0, w, h);
+        if let Some(r) = active {
+            cr.rectangle(r.x, r.y, r.w, r.h);
+            cr.set_fill_rule(cairo::FillRule::EvenOdd);
+        }
+        cr.fill().ok();
+        cr.set_fill_rule(cairo::FillRule::Winding);
     }
-    cr.fill().ok();
-    cr.set_fill_rule(cairo::FillRule::Winding);
 
     let (cx, cy) = (s.cursor.0 - g.x, s.cursor.1 - g.y);
     let on_this = s.has_cursor && cx >= 0.0 && cy >= 0.0 && cx < w && cy < h;
 
     // crosshair
-    if on_this && s.start.is_none() && !s.window_mode {
+    if on_this && s.start.is_none() && !s.picking_windows() {
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
         cr.set_line_width(1.0);
         cr.move_to(0.0, cy.floor() + 0.5);
@@ -340,17 +410,29 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
         cr.rectangle(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0);
         cr.stroke().ok();
         let px = s.to_px(&R { x: r.x + g.x, y: r.y + g.y, ..r });
-        label(cr, &format!("{} × {}", px.2, px.3), r.x, (r.y - 26.0).max(2.0), w);
+        // above the selection, or just inside it when it touches the top edge
+        let ly = if r.y - 26.0 >= 2.0 { r.y - 26.0 } else { (r.y + 6.0).max(2.0) };
+        label(cr, &format!("{} × {}", px.2, px.3), r.x.max(0.0) + if ly > r.y { 6.0 } else { 0.0 }, ly, w);
     }
 
-    // help text
-    let help = if s.window_mode {
+    // help text: bottom left, moved to the top when it would cover the
+    // selection or the pointer
+    let help = if s.picking_windows() {
         "Window mode · click a window · Space: region mode · Esc: cancel"
+    } else if s.windows.is_empty() {
+        "Drag to select · Esc: cancel"
     } else {
         "Drag to select · click a window to capture it · Space: window mode · Esc: cancel"
     };
     if on_this {
-        label(cr, help, 12.0, h - 36.0, w);
+        let hw = label_width(cr, help);
+        let covers = |y: f64| {
+            let hr = R { x: 12.0 - 8.0, y: y - 8.0, w: hw + 16.0, h: 24.0 + 16.0 };
+            active.map(|r| r.intersect(&hr).w > 0.0 && r.intersect(&hr).h > 0.0).unwrap_or(false)
+                || hr.contains((cx, cy))
+        };
+        let y = if covers(h - 36.0) && !covers(12.0) { 12.0 } else { h - 36.0 };
+        label(cr, help, 12.0, y, w);
     }
 
     if on_this && s.magnifier {
@@ -358,11 +440,14 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
     }
 }
 
-fn label(cr: &cairo::Context, text: &str, x: f64, y: f64, maxw: f64) {
+fn label_width(cr: &cairo::Context, text: &str) -> f64 {
     cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
     cr.set_font_size(13.0);
-    let ext = cr.text_extents(text).unwrap();
-    let bw = ext.x_advance() + 16.0;
+    cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(text.len() as f64 * 8.0) + 16.0
+}
+
+fn label(cr: &cairo::Context, text: &str, x: f64, y: f64, maxw: f64) {
+    let bw = label_width(cr, text);
     let x = x.min(maxw - bw - 2.0).max(2.0);
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.75);
     rounded(cr, x, y, bw, 24.0, 5.0);

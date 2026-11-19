@@ -1,13 +1,13 @@
 [package]
 name = "linshot"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Screenshot and annotation tool for Linux (X11 and Wayland)"
 license = "GPL-3.0-or-later"
 authors = ["Aditya Telange <21258296+adityatelange@users.noreply.github.com>"]
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+gtk = { package = "gtk4", version = "0.9", features = ["v4_6"] }
 cairo-rs = { version = "0.20", features = ["png"] }
 pangocairo = "0.20"
 async-channel = "2"

@@ -4,7 +4,7 @@
 use crate::config::{self, AfterCapture};
 use crate::{capture, shortcuts, Ctx};
 use gtk::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 use std::rc::Rc;
 
 const ACTIONS: [(AfterCapture, &str); 4] = [
@@ -18,6 +18,7 @@ pub fn show(ctx: &Rc<Ctx>) {
     let cfg = ctx.cfg.borrow().clone();
     let win = gtk::Window::builder().title("Linshot preferences").modal(false).resizable(false).build();
     win.set_application(Some(&ctx.app));
+    win.add_css_class("ls-prefs");
 
     let grid = gtk::Grid::builder()
         .row_spacing(10)
@@ -31,6 +32,7 @@ pub fn show(ctx: &Rc<Ctx>) {
     let mut add = |label: &str, w: &gtk::Widget| {
         let l = gtk::Label::new(Some(label));
         l.set_xalign(1.0);
+        l.add_css_class("ls-prefs-label");
         grid.attach(&l, 0, row, 1, 1);
         grid.attach(w, 1, row, 1, 1);
         row += 1;
@@ -87,11 +89,14 @@ pub fn show(ctx: &Rc<Ctx>) {
     let sc_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let sc_add = gtk::Button::with_label("Set up Print key shortcuts");
     let sc_remove = gtk::Button::with_label("Remove");
+    // own row under the buttons, wrapped: unwrapped it stretched the window to ~850px
     let sc_state = gtk::Label::new(None);
-    sc_state.add_css_class("dim-label");
+    sc_state.add_css_class("ls-prefs-note");
+    sc_state.set_wrap(true);
+    sc_state.set_xalign(0.0);
+    sc_state.set_max_width_chars(44);
     sc_box.append(&sc_add);
     sc_box.append(&sc_remove);
-    sc_box.append(&sc_state);
     let refresh_sc = {
         let (sc_add, sc_remove, sc_state) = (sc_add.clone(), sc_remove.clone(), sc_state.clone());
         move || {
@@ -99,6 +104,7 @@ pub fn show(ctx: &Rc<Ctx>) {
             let on = ok && shortcuts::installed();
             sc_add.set_sensitive(ok);
             sc_remove.set_sensitive(on);
+            sc_state.set_visible(!ok || on);
             sc_state.set_text(if !ok {
                 "not available on this desktop — bind the commands below manually"
             } else if on {
@@ -130,13 +136,22 @@ pub fn show(ctx: &Rc<Ctx>) {
         });
     }
     add("Shortcuts", sc_box.upcast_ref());
+    add("", sc_state.upcast_ref());
 
     let session = if capture::is_wayland() { "Wayland" } else if capture::is_x11() { "X11" } else { "unknown" };
-    let info = gtk::Label::new(Some(&format!(
+    let mut text = format!(
         "Session: {session}.  Shortcut commands for your desktop's keyboard settings:\n\
          linshot region · linshot window · linshot full · linshot last"
-    )));
-    info.add_css_class("dim-label");
+    );
+    if let Some(h) = shortcuts::manual_hint() {
+        text.push_str("\n\n");
+        text.push_str(h);
+    }
+    let info = gtk::Label::new(Some(&text));
+    info.set_selectable(true);
+    info.add_css_class("ls-prefs-note");
+    info.set_max_width_chars(60);
+    info.set_margin_top(4);
     info.set_xalign(0.0);
     info.set_wrap(true);
     grid.attach(&info, 0, row, 2, 1);
@@ -146,7 +161,8 @@ pub fn show(ctx: &Rc<Ctx>) {
     buttons.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
     let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
+    save.add_css_class("ls-primary");
+    cancel.add_css_class("ls-soft");
     buttons.append(&cancel);
     buttons.append(&save);
     grid.attach(&buttons, 0, row, 2, 1);
@@ -156,11 +172,10 @@ pub fn show(ctx: &Rc<Ctx>) {
         let dir = dir.clone();
         let win = win.clone();
         browse.connect_clicked(move |_| {
-            let dlg = gtk::FileDialog::builder().title("Screenshot folder").modal(true).build();
-            dlg.set_initial_folder(Some(&gio::File::for_path(config::shellexpand(&dir.text()))));
+            let initial = std::path::PathBuf::from(config::shellexpand(&dir.text()));
             let dir = dir.clone();
-            dlg.select_folder(Some(&win), gio::Cancellable::NONE, move |r| {
-                if let Ok(Some(p)) = r.map(|f| f.path()) {
+            crate::compat::select_folder(Some(win.upcast_ref()), "Screenshot folder", &initial, move |p| {
+                if let Some(p) = p {
                     dir.set_text(&p.to_string_lossy());
                 }
             });
@@ -196,5 +211,7 @@ pub fn show(ctx: &Rc<Ctx>) {
         });
     }
     let _ = glib::Propagation::Proceed;
+    // don't open with the whole folder path selected in the first entry
+    GtkWindowExt::set_focus(&win, Some(&save));
     win.present();
 }

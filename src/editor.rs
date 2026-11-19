@@ -298,14 +298,7 @@ fn obfuscate(cr: &cairo::Context, s: &Shape, bg: &ImageSurface) {
     let block = if s.kind == Tool::Pixelate { (s.width * 4.0).clamp(4.0, 64.0) } else { (s.width * 2.5).clamp(3.0, 40.0) };
     let sw = ((rw / block).ceil() as i32).max(1);
     let sh = ((rh / block).ceil() as i32).max(1);
-    let Ok(small) = ImageSurface::create(cairo::Format::ARgb32, sw, sh) else { return };
-    {
-        let c = cairo::Context::new(&small).unwrap();
-        c.scale(sw as f64 / rw, sh as f64 / rh);
-        c.set_source_surface(bg, -rx, -ry).ok();
-        c.source().set_filter(cairo::Filter::Good);
-        c.paint().ok();
-    }
+    let Some(small) = obfuscated(bg, [rx as i64, ry as i64, rw as i64, rh as i64, sw as i64, sh as i64]) else { return };
     cr.save().ok();
     cr.rectangle(rx, ry, rw, rh);
     cr.clip();
@@ -317,6 +310,50 @@ fn obfuscate(cr: &cairo::Context, s: &Shape, bg: &ImageSurface) {
     pat.set_filter(if s.kind == Tool::Pixelate { cairo::Filter::Nearest } else { cairo::Filter::Bilinear });
     cr.paint().ok();
     cr.restore().ok();
+}
+
+/// Downscaled copies of background areas for pixelate / blur, kept on the
+/// background surface itself so they live exactly as long as it does.
+/// Recomputing them (a filtered downscale of the area) on every redraw made
+/// dragging or drawing anything slow once a few obfuscations existed.
+#[derive(Default)]
+struct ObfCache(RefCell<Vec<([i64; 6], ImageSurface)>>);
+
+static OBF_KEY: cairo::UserDataKey<ObfCache> = cairo::UserDataKey::new();
+const OBF_CACHE_MAX: usize = 32;
+
+/// The area [x, y, w, h] of `bg` scaled down to [.., .., .., .., sw, sh].
+fn obfuscated(bg: &ImageSurface, key: [i64; 6]) -> Option<ImageSurface> {
+    let cache = match bg.user_data(&OBF_KEY) {
+        Some(c) => c,
+        None => {
+            let c = std::rc::Rc::new(ObfCache::default());
+            bg.set_user_data(&OBF_KEY, c.clone()).ok()?;
+            c
+        }
+    };
+    let mut entries = cache.0.borrow_mut();
+    if let Some(i) = entries.iter().position(|(k, _)| *k == key) {
+        // most recently used last
+        let e = entries.remove(i);
+        let img = e.1.clone();
+        entries.push(e);
+        return Some(img);
+    }
+    let [rx, ry, rw, rh, sw, sh] = key;
+    let small = ImageSurface::create(cairo::Format::ARgb32, sw as i32, sh as i32).ok()?;
+    {
+        let c = cairo::Context::new(&small).ok()?;
+        c.scale(sw as f64 / rw as f64, sh as f64 / rh as f64);
+        c.set_source_surface(bg, -rx as f64, -ry as f64).ok()?;
+        c.source().set_filter(cairo::Filter::Good);
+        c.paint().ok()?;
+    }
+    if entries.len() >= OBF_CACHE_MAX {
+        entries.remove(0);
+    }
+    entries.push((key, small.clone()));
+    Some(small)
 }
 
 #[derive(Clone)]
@@ -333,13 +370,13 @@ fn draw_doc(cr: &cairo::Context, d: &Doc) {
     }
 }
 
-fn render(d: &Doc) -> ImageSurface {
-    let out = ImageSurface::create(cairo::Format::ARgb32, d.bg.width(), d.bg.height()).unwrap();
+fn render(d: &Doc) -> Result<ImageSurface, String> {
+    let out = ImageSurface::create(cairo::Format::ARgb32, d.bg.width(), d.bg.height()).map_err(|e| e.to_string())?;
     {
-        let cr = cairo::Context::new(&out).unwrap();
+        let cr = cairo::Context::new(&out).map_err(|e| e.to_string())?;
         draw_doc(&cr, d);
     }
-    out
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -378,6 +415,11 @@ impl Ed {
         }
         self.redo.clear();
         self.dirty = true;
+        // snapshots share the background unless a crop made a new one; keep the
+        // images only the undo history holds under a memory budget
+        while self.undo.len() > 1 && history_bytes(&self.doc, &self.undo) > UNDO_IMAGE_BUDGET {
+            self.undo.remove(0);
+        }
     }
     fn renumber(&mut self) {
         let mut n = 0;
@@ -410,11 +452,31 @@ impl Ed {
     }
 }
 
+/// Memory the undo history may spend on backgrounds the current document no
+/// longer uses (each crop step keeps the previous full image).
+const UNDO_IMAGE_BUDGET: usize = 768 << 20;
+
+/// Bytes of distinct background images in `history` other than `cur`'s.
+fn history_bytes(cur: &Doc, history: &[Doc]) -> usize {
+    let mut seen = vec![cur.bg.to_raw_none()];
+    let mut total = 0;
+    for d in history {
+        let p = d.bg.to_raw_none();
+        if !seen.contains(&p) {
+            seen.push(p);
+            total += d.bg.stride().max(0) as usize * d.bg.height().max(0) as usize;
+        }
+    }
+    total
+}
+
 /// Space around the image on the canvas (logical px).
 const PAD: f64 = 40.0;
 /// Room kept free for the floating dock (left) and property bar (bottom).
 const DOCK_W: i32 = 76;
 const BAR_H: i32 = 72;
+/// Extra room at the top so the zoom pill does not cover the image.
+const TOP_H: i32 = 20;
 
 const PALETTE: [[f64; 4]; 8] = [
     [0.937, 0.267, 0.267, 1.0],
@@ -452,9 +514,9 @@ struct Ui {
     redo_btn: gtk::Button,
     del_btn: gtk::Button,
     tools: Vec<(Tool, gtk::ToggleButton)>,
-    color: gtk::ColorDialogButton,
+    color: gtk::ColorButton,
     swatches: Vec<gtk::Button>,
-    fill: gtk::ColorDialogButton,
+    fill: gtk::ColorButton,
     fill_chk: gtk::ToggleButton,
     width: gtk::Scale,
     width_cap: gtk::Label,
@@ -469,7 +531,17 @@ pub struct Editor {
     ui: Ui,
     ctx: Rc<Ctx>,
     syncing: Cell<bool>,
+    /// pointer position over the canvas (scroller coordinates)
+    pointer: Cell<Option<(f64, f64)>>,
     last_style_ckpt: Cell<Option<std::time::Instant>>,
+    /// background pre-scaled for the current zoom (see `scaled_bg`)
+    view: RefCell<Option<ScaledBg>>,
+}
+
+struct ScaledBg {
+    src: ImageSurface,
+    scale: f64,
+    img: ImageSurface,
 }
 
 thread_local! {
@@ -497,7 +569,7 @@ fn glyph(kind: Tool, size: i32) -> gtk::DrawingArea {
     a.set_content_height(size);
     a.set_can_target(false);
     a.set_draw_func(move |w, cr, width, _| {
-        let c = w.color();
+        let c = crate::compat::fg_color(w);
         let s = width as f64 / 20.0;
         cr.scale(s, s);
         cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
@@ -622,7 +694,7 @@ fn prop_glyph(name: &'static str) -> gtk::DrawingArea {
     a.set_content_height(18);
     a.set_can_target(false);
     a.set_draw_func(move |w, cr, width, _| {
-        let c = w.color();
+        let c = crate::compat::fg_color(w);
         cr.scale(width as f64 / 20.0, width as f64 / 20.0);
         cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
         cr.set_line_width(1.7);
@@ -651,6 +723,20 @@ fn cap(text: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.add_css_class("ls-cap");
     l
+}
+
+/// Makes the swatch inside a colour button a small circle like the palette
+/// swatches (GTK sizes it as a wide rectangle by default).
+fn round_color_button(w: &impl IsA<gtk::Widget>) {
+    let mut child = w.as_ref().first_child();
+    while let Some(c) = child {
+        if c.css_name() == "colorswatch" {
+            c.set_size_request(16, 16);
+        } else {
+            round_color_button(&c);
+        }
+        child = c.next_sibling();
+    }
 }
 
 fn hbox(spacing: i32) -> gtk::Box {
@@ -725,6 +811,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     area.set_focusable(true);
     area.set_margin_start(DOCK_W);
     area.set_margin_bottom(BAR_H);
+    area.set_margin_top(TOP_H);
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_child(Some(&area));
     scroller.set_hexpand(true);
@@ -735,11 +822,21 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
 
     // ---------------------------------------------------------------- tool dock
     let dock = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    dock.add_css_class("ls-dock");
-    dock.set_halign(gtk::Align::Start);
-    dock.set_valign(gtk::Align::Center);
-    dock.set_margin_start(14);
-    dock.set_margin_bottom(BAR_H / 2);
+    dock.add_css_class("ls-dock-tools");
+    // scrolls instead of being clipped when the window is too short for all tools
+    let dock_frame = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .propagate_natural_width(true)
+        .child(&dock)
+        .build();
+    dock_frame.add_css_class("ls-dock");
+    dock_frame.set_halign(gtk::Align::Start);
+    dock_frame.set_valign(gtk::Align::Center);
+    dock_frame.set_margin_start(14);
+    dock_frame.set_margin_top(12);
+    dock_frame.set_margin_bottom(BAR_H / 2);
     let mut tools = Vec::new();
     let mut first: Option<gtk::ToggleButton> = None;
     for (t, _, tip, _) in TOOLS {
@@ -758,7 +855,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
         dock.append(&b);
         tools.push((*t, b));
     }
-    overlay.add_overlay(&dock);
+    overlay.add_overlay(&dock_frame);
 
     // ---------------------------------------------------------------- property bar
     let props = hbox(4);
@@ -769,7 +866,6 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     props.set_margin_start(DOCK_W);
 
     let color_g = hbox(2);
-    let dialog = gtk::ColorDialog::builder().with_alpha(true).build();
     let mut swatches = Vec::new();
     for i in 0..PALETTE.len() {
         let b = gtk::Button::new();
@@ -781,10 +877,11 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
         color_g.append(&b);
         swatches.push(b);
     }
-    let color = gtk::ColorDialogButton::new(Some(dialog.clone()));
-    color.set_rgba(&to_rgba(cfg.line_color));
+    let color = crate::compat::color_button(&to_rgba(cfg.line_color));
     color.set_tooltip_text(Some("Custom colour"));
     color.set_valign(gtk::Align::Center);
+    round_color_button(&color);
+    color.add_css_class("ls-custom");
     color_g.append(&color);
 
     let fill_g = hbox(2);
@@ -792,10 +889,10 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     fill_chk.set_child(Some(&prop_glyph("fill")));
     fill_chk.set_tooltip_text(Some("Fill shape / text background"));
     fill_chk.set_active(cfg.fill_enabled);
-    let fill = gtk::ColorDialogButton::new(Some(dialog));
-    fill.set_rgba(&to_rgba(cfg.fill_color));
+    let fill = crate::compat::color_button(&to_rgba(cfg.fill_color));
     fill.set_tooltip_text(Some("Fill colour"));
     fill.set_valign(gtk::Align::Center);
+    round_color_button(&fill);
     fill_g.append(&fill_chk);
     fill_g.append(&fill);
 
@@ -813,6 +910,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
 
     let font_g = hbox(4);
     let font = gtk::SpinButton::with_range(6.0, 120.0, 1.0);
+    font.set_numeric(true);
     font.set_value(cfg.font_size);
     font.set_valign(gtk::Align::Center);
     font.set_tooltip_text(Some("Font size"));
@@ -902,7 +1000,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
         .map(|(_, g)| (g.w, g.h))
         .unwrap_or((1366.0, 768.0));
     let (maxw, maxh) = (mw * 0.88, mh * 0.88);
-    let chrome = (DOCK_W as f64 + 2.0 * PAD + 8.0, BAR_H as f64 + 2.0 * PAD + 56.0);
+    let chrome = (DOCK_W as f64 + 2.0 * PAD + 8.0, (BAR_H + TOP_H) as f64 + 2.0 * PAD + 56.0);
     let zoom = (1.0f64).min((maxw - chrome.0) / iw).min((maxh - chrome.1) / ih).max(0.05);
     let ww = (iw * zoom + chrome.0).clamp(980.0, maxw.max(980.0));
     let wh = (ih * zoom + chrome.1).clamp(620.0, maxh.max(620.0));
@@ -982,7 +1080,9 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
         },
         ctx: ctx.clone(),
         syncing: Cell::new(false),
+        pointer: Cell::new(None),
         last_style_ckpt: Cell::new(None),
+        view: RefCell::new(None),
     });
     OPEN.with(|o| o.borrow_mut().push(e.clone()));
 
@@ -1151,6 +1251,17 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     }
     area.add_controller(dbl);
 
+    let area_motion = gtk::EventControllerMotion::new();
+    {
+        let w = Rc::downgrade(&e);
+        area_motion.connect_motion(move |_, x, y| {
+            if let Some(e) = w.upgrade() {
+                e.update_cursor(Some(e.to_img(x, y)));
+            }
+        });
+    }
+    area.add_controller(area_motion);
+
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     {
         let w = Rc::downgrade(&e);
@@ -1158,7 +1269,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
             let Some(e) = w.upgrade() else { return glib::Propagation::Proceed };
             if c.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
                 let z = e.ed.borrow().zoom * if dy < 0.0 { 1.15 } else { 1.0 / 1.15 };
-                e.set_zoom(z);
+                e.zoom_at(z, e.pointer.get());
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -1166,6 +1277,22 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
         });
     }
     scroller.add_controller(scroll);
+    let hover = gtk::EventControllerMotion::new();
+    {
+        let w = Rc::downgrade(&e);
+        hover.connect_motion(move |_, x, y| {
+            if let Some(e) = w.upgrade() {
+                e.pointer.set(Some((x, y)));
+            }
+        });
+        let w = Rc::downgrade(&e);
+        hover.connect_leave(move |_| {
+            if let Some(e) = w.upgrade() {
+                e.pointer.set(None);
+            }
+        });
+    }
+    scroller.add_controller(hover);
 
     let keys = gtk::EventControllerKey::new();
     {
@@ -1227,6 +1354,8 @@ impl Editor {
         self.ui.redo_btn.set_sensitive(!ed.redo.is_empty());
         self.ui.del_btn.set_visible(ed.sel.is_some());
         self.ui.crop_bar.set_visible(ed.crop.is_some());
+        // keep toasts below the crop bar instead of on top of it
+        self.ui.toast.set_margin_top(if ed.crop.is_some() { 66 } else { 14 });
         let state = match (&ed.path, ed.dirty) {
             (Some(p), false) => format!(" · saved as {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
             (_, true) => " · edited".into(),
@@ -1242,13 +1371,13 @@ impl Editor {
     fn toast(&self, msg: &str) {
         self.ui.toast_label.set_text(msg);
         self.ui.toast.set_reveal_child(true);
-        let gen = self.ui.toast_gen.get() + 1;
-        self.ui.toast_gen.set(gen);
+        let generation = self.ui.toast_gen.get() + 1;
+        self.ui.toast_gen.set(generation);
         let toast = self.ui.toast.clone();
         let w = OPEN.with(|o| o.borrow().iter().find(|e| e.ui.toast == toast).map(Rc::downgrade));
         glib::timeout_add_local_once(std::time::Duration::from_millis(1800), move || {
             if let Some(e) = w.and_then(|w| w.upgrade()) {
-                if e.ui.toast_gen.get() == gen {
+                if e.ui.toast_gen.get() == generation {
                     e.ui.toast.set_reveal_child(false);
                 }
             }
@@ -1256,8 +1385,37 @@ impl Editor {
     }
 
     fn set_zoom(&self, z: f64) {
-        self.ed.borrow_mut().zoom = z.clamp(0.05, 16.0);
+        self.zoom_at(z, None);
+    }
+
+    /// Changes the zoom keeping the image point under `anchor` (scroller
+    /// coordinates; the middle of the view when `None`) where it is.
+    fn zoom_at(&self, z: f64, anchor: Option<(f64, f64)>) {
+        let z = z.clamp(0.05, 16.0);
+        let sc = &self.ui.scroller;
+        let (vw, vh) = (sc.width() as f64, sc.height() as f64);
+        let (ax, ay) = anchor.unwrap_or((vw / 2.0, vh / 2.0));
+        let img_pt = sc
+            .compute_point(&self.ui.area, &gtk::graphene::Point::new(ax as f32, ay as f32))
+            .map(|p| self.to_img(p.x() as f64, p.y() as f64));
+        let (iw, ih) = {
+            let mut ed = self.ed.borrow_mut();
+            ed.zoom = z;
+            (ed.doc.bg.width() as f64, ed.doc.bg.height() as f64)
+        };
         self.refresh();
+        let Some((px, py)) = img_pt else { return };
+        // the scrolled content once the new size is allocated (area plus its margins)
+        let cw = iw * z + 2.0 * PAD + DOCK_W as f64;
+        let ch = ih * z + 2.0 * PAD + (BAR_H + TOP_H) as f64;
+        for (adj, content, view, pos) in [
+            (sc.hadjustment(), cw, vw, DOCK_W as f64 + PAD + px * z - ax),
+            (sc.vadjustment(), ch, vh, TOP_H as f64 + PAD + py * z - ay),
+        ] {
+            if content > view {
+                adj.configure(pos.clamp(0.0, content - view), 0.0, content, adj.step_increment(), adj.page_increment(), view);
+            }
+        }
     }
 
     fn zoom_fit(&self) {
@@ -1266,7 +1424,7 @@ impl Editor {
             (ed.doc.bg.width() as f64, ed.doc.bg.height() as f64)
         };
         let aw = self.ui.scroller.width() as f64 - 2.0 * PAD - DOCK_W as f64 - 4.0;
-        let ah = self.ui.scroller.height() as f64 - 2.0 * PAD - BAR_H as f64 - 4.0;
+        let ah = self.ui.scroller.height() as f64 - 2.0 * PAD - (BAR_H + TOP_H) as f64 - 4.0;
         if aw > 10.0 && ah > 10.0 {
             self.set_zoom((aw / w).min(ah / h).min(1.0));
         }
@@ -1333,13 +1491,27 @@ impl Editor {
                 b.set_active(true);
             }
         }
-        self.ui.area.set_cursor_from_name(Some(match t {
+        self.update_cursor(None);
+        self.update_props();
+        self.refresh();
+    }
+
+    /// Tool cursor, or a move cursor over something that can be dragged.
+    fn update_cursor(&self, p: Option<Pt>) {
+        let tool = self.ed.borrow().tool;
+        let movable = p.and_then(|p| self.hit(p)).map(|i| {
+            let k = self.ed.borrow().doc.shapes[i].kind;
+            tool == Tool::Select || (k == Tool::Pointer && tool != Tool::Crop)
+        });
+        let name = match tool {
+            _ if movable == Some(true) => "move",
             Tool::Select => "default",
             Tool::Text => "text",
             _ => "crosshair",
-        }));
-        self.update_props();
-        self.refresh();
+        };
+        if self.ui.area.cursor().and_then(|c| c.name()).as_deref() != Some(name) {
+            self.ui.area.set_cursor_from_name(Some(name));
+        }
     }
 
     fn style_changed(&self) {
@@ -1375,14 +1547,15 @@ impl Editor {
                 ed.checkpoint();
             }
             self.last_style_ckpt.set(Some(now));
-            let s = &mut ed.doc.shapes[i];
-            if !matches!(s.kind, Tool::Highlight | Tool::Pixelate | Tool::Blur) {
-                s.color = style.color;
-                s.fill = style.fill_on.then_some(style.fill);
+            if let Some(s) = ed.doc.shapes.get_mut(i) {
+                if !matches!(s.kind, Tool::Highlight | Tool::Pixelate | Tool::Blur) {
+                    s.color = style.color;
+                    s.fill = style.fill_on.then_some(style.fill);
+                }
+                s.width = style.width;
+                s.font = style.font;
+                s.shadow = style.shadow;
             }
-            s.width = style.width;
-            s.font = style.font;
-            s.shadow = style.shadow;
         }
         drop(ed);
         self.refresh();
@@ -1462,7 +1635,9 @@ impl Editor {
                 }
                 let mut s = orig;
                 s.translate(p.0 - ed.drag_start.0, p.1 - ed.drag_start.1);
-                ed.doc.shapes[i] = s;
+                if let Some(slot) = ed.doc.shapes.get_mut(i) {
+                    *slot = s;
+                }
             }
         } else if let Some(mut s) = ed.preview.take() {
             let mut b = p;
@@ -1526,6 +1701,40 @@ impl Editor {
     }
 
     fn draw(&self, _area: &gtk::DrawingArea, cr: &cairo::Context) {
+        let t = std::time::Instant::now();
+        self.draw_impl(cr);
+        crate::trace("editor draw", t);
+    }
+
+    /// The background downscaled to `scale` device pixels per image pixel,
+    /// computed once per zoom level. GTK records the draw function and
+    /// replays it when rendering the frame; painting the full-size image
+    /// with cairo's downscaling filter made every frame take ~170 ms for an
+    /// 8K screenshot, even while just dragging a shape.
+    fn scaled_bg(&self, bg: &ImageSurface, scale: f64) -> Option<ImageSurface> {
+        let mut v = self.view.borrow_mut();
+        if let Some(c) = v.as_ref() {
+            if c.src.to_raw_none() == bg.to_raw_none() && c.scale == scale {
+                return Some(c.img.clone());
+            }
+        }
+        *v = None;
+        let w = ((bg.width() as f64 * scale).round() as i32).max(1);
+        let h = ((bg.height() as f64 * scale).round() as i32).max(1);
+        let img = ImageSurface::create(cairo::Format::ARgb32, w, h).ok()?;
+        let cr = cairo::Context::new(&img).ok()?;
+        cr.scale(w as f64 / bg.width() as f64, h as f64 / bg.height() as f64);
+        cr.set_source_surface(bg, 0.0, 0.0).ok()?;
+        cr.source().set_filter(cairo::Filter::Good);
+        cr.paint().ok()?;
+        drop(cr);
+        *v = Some(ScaledBg { src: bg.clone(), scale, img: img.clone() });
+        Some(img)
+    }
+
+    fn draw_impl(&self, cr: &cairo::Context) {
+        // device pixels per logical pixel (HiDPI), before our own transforms
+        let ds = cr.matrix().xx().abs().max(0.01);
         let ed = self.ed.borrow();
         let (iw, ih) = (ed.doc.bg.width() as f64 * ed.zoom, ed.doc.bg.height() as f64 * ed.zoom);
         // soft drop shadow under the image
@@ -1549,7 +1758,24 @@ impl Editor {
                 draw_shape(cr, s, &ed.doc.bg);
             }
         } else {
-            draw_doc(cr, &ed.doc);
+            let scale = ed.zoom * ds;
+            let (bw, bh) = (ed.doc.bg.width() as f64, ed.doc.bg.height() as f64);
+            match (scale < 0.999).then(|| self.scaled_bg(&ed.doc.bg, scale)).flatten() {
+                Some(small) => {
+                    cr.save().ok();
+                    cr.scale(bw / small.width() as f64, bh / small.height() as f64);
+                    cr.set_source_surface(&small, 0.0, 0.0).ok();
+                    cr.paint().ok();
+                    cr.restore().ok();
+                    for s in &ed.doc.shapes {
+                        draw_shape(cr, s, &ed.doc.bg);
+                    }
+                }
+                None => {
+                    *self.view.borrow_mut() = None;
+                    draw_doc(cr, &ed.doc);
+                }
+            }
         }
         if let Some(p) = &ed.preview {
             if p.kind != Tool::Crop {
@@ -1557,6 +1783,8 @@ impl Editor {
             }
         }
         let lw = 1.0 / ed.zoom;
+        // the selection outline may reach past the image edge
+        cr.reset_clip();
         if let Some(i) = ed.sel {
             if let Some(s) = ed.doc.shapes.get(i) {
                 let r = s.bbox();
@@ -1688,11 +1916,20 @@ impl Editor {
         let Some(c) = ed.crop.take() else { return };
         let (x, y) = (c.x.round() as i32, c.y.round() as i32);
         let (w, h) = (c.w.round() as i32, c.h.round() as i32);
-        if w < 1 || h < 1 {
-            return;
-        }
+        let bg = if w < 1 || h < 1 { Err(String::new()) } else { imageops::crop(&ed.doc.bg, x, y, w, h) };
+        let bg = match bg {
+            Ok(bg) => bg,
+            Err(e) => {
+                drop(ed);
+                self.refresh();
+                if !e.is_empty() {
+                    self.ctx.error(Some(self.ui.win.upcast_ref()), &format!("Could not crop: {e}"));
+                }
+                return;
+            }
+        };
         ed.checkpoint();
-        ed.doc.bg = imageops::crop(&ed.doc.bg, x, y, w, h);
+        ed.doc.bg = bg;
         for s in &mut ed.doc.shapes {
             s.translate(-x as f64, -y as f64);
         }
@@ -1714,7 +1951,7 @@ impl Editor {
         sw.set_child(Some(&tv));
         sw.set_size_request(260, 90);
         let ok = gtk::Button::with_label(if edit.is_some() { "Update text" } else { "Add text" });
-        ok.add_css_class("suggested-action");
+        ok.add_css_class("ls-primary");
         let hint = gtk::Label::new(Some("Ctrl+Enter to confirm"));
         hint.add_css_class("dim-label");
         bx.append(&sw);
@@ -1734,6 +1971,8 @@ impl Editor {
                 let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
                 if let Some(e) = w.upgrade() {
                     let mut ed = e.ed.borrow_mut();
+                    // the shape list may have changed while the popover was open
+                    let edit = edit.filter(|&i| ed.doc.shapes.get(i).map(|s| s.kind) == Some(Tool::Text));
                     match edit {
                         Some(i) if text.trim().is_empty() => {
                             ed.checkpoint();
@@ -1784,12 +2023,20 @@ impl Editor {
         tv.grab_focus();
     }
 
-    fn rendered(&self) -> ImageSurface {
-        render(&self.ed.borrow().doc)
+    /// The annotated image; reports the error (e.g. out of memory) itself.
+    fn rendered(&self) -> Option<ImageSurface> {
+        let r = render(&self.ed.borrow().doc);
+        match r {
+            Ok(img) => Some(img),
+            Err(e) => {
+                self.ctx.error(Some(self.ui.win.upcast_ref()), &format!("Could not render the image: {e}"));
+                None
+            }
+        }
     }
 
     fn save_to(&self, path: PathBuf) -> bool {
-        let img = self.rendered();
+        let Some(img) = self.rendered() else { return false };
         let q = self.ctx.cfg.borrow().jpeg_quality;
         match imageops::save(&img, &path, q) {
             Ok(()) => {
@@ -1819,44 +2066,29 @@ impl Editor {
     fn save_as(self: &Rc<Self>) {
         let cfg = self.ctx.cfg.borrow().clone();
         let suggested = self.ed.borrow().path.clone().unwrap_or_else(|| cfg.next_output_path());
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        for (name, pats) in [("PNG image", ["*.png", ""]), ("JPEG image", ["*.jpg", "*.jpeg"])] {
-            let f = gtk::FileFilter::new();
-            f.set_name(Some(name));
-            for p in pats.iter().filter(|p| !p.is_empty()) {
-                f.add_pattern(p);
-            }
-            filters.append(&f);
-        }
-        let dlg = gtk::FileDialog::builder()
-            .title("Save screenshot")
-            .initial_name(suggested.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
-            .filters(&filters)
-            .modal(true)
-            .build();
-        if let Some(d) = suggested.parent() {
-            dlg.set_initial_folder(Some(&gio::File::for_path(d)));
-        }
+        let filters = [
+            crate::compat::Filter { name: "PNG image", patterns: &["*.png"], pixbuf_formats: false },
+            crate::compat::Filter { name: "JPEG image", patterns: &["*.jpg", "*.jpeg"], pixbuf_formats: false },
+        ];
         let w = Rc::downgrade(self);
-        dlg.save(Some(&self.ui.win), gio::Cancellable::NONE, move |res| {
-            if let (Ok(f), Some(e)) = (res, w.upgrade()) {
-                if let Some(mut p) = f.path() {
-                    if p.extension().is_none() {
-                        p.set_extension("png");
-                    }
-                    e.save_to(p);
+        crate::compat::save_file(Some(self.ui.win.upcast_ref()), "Save screenshot", &suggested, &filters, move |res| {
+            if let (Some(mut p), Some(e)) = (res, w.upgrade()) {
+                if p.extension().is_none() {
+                    p.set_extension("png");
                 }
+                e.save_to(p);
             }
         });
     }
 
     fn copy(&self) {
-        imageops::copy_to_clipboard(&self.rendered());
+        let Some(img) = self.rendered() else { return };
+        imageops::copy_to_clipboard(&img);
         self.toast("Copied to clipboard");
     }
 
     fn print(&self) {
-        let img = self.rendered();
+        let Some(img) = self.rendered() else { return };
         let op = gtk::PrintOperation::new();
         op.set_n_pages(1);
         op.set_job_name("Linshot screenshot");
@@ -1877,34 +2109,71 @@ impl Editor {
     fn close_request(self: &Rc<Self>) -> glib::Propagation {
         let ed = self.ed.borrow();
         if ed.allow_close || !ed.dirty {
+            drop(ed);
+            // GTK 4 only disposes a closed window (and emits "destroy") once
+            // nothing references it, but OPEN holds the editor which holds the
+            // window: forget it here or every editor (with its images and undo
+            // history) stays in memory for the life of the process
+            OPEN.with(|o| o.borrow_mut().retain(|x| !Rc::ptr_eq(x, self)));
             return glib::Propagation::Proceed;
         }
         drop(ed);
-        let dlg = gtk::AlertDialog::builder()
-            .modal(true)
-            .message("Save changes to this screenshot?")
-            .detail("Your annotations will be lost if you don't save them.")
-            .buttons(["Save", "Discard", "Cancel"])
-            .default_button(0)
-            .cancel_button(2)
-            .build();
         let w = Rc::downgrade(self);
-        dlg.choose(Some(&self.ui.win), gio::Cancellable::NONE, move |r| {
-            let Some(e) = w.upgrade() else { return };
-            let close = match r {
-                Ok(0) => {
-                    let p = e.ed.borrow().path.clone().unwrap_or_else(|| e.ctx.cfg.borrow().next_output_path());
-                    e.save_to(p)
+        crate::compat::choose(
+            Some(self.ui.win.upcast_ref()),
+            "Save changes to this screenshot?",
+            "Your annotations will be lost if you don't save them.",
+            &["_Save", "_Discard", "_Cancel"],
+            0,
+            2,
+            move |r| {
+                let Some(e) = w.upgrade() else { return };
+                let close = match r {
+                    0 => {
+                        let p = e.ed.borrow().path.clone().unwrap_or_else(|| e.ctx.cfg.borrow().next_output_path());
+                        e.save_to(p)
+                    }
+                    1 => true,
+                    _ => false,
+                };
+                if close {
+                    e.ed.borrow_mut().allow_close = true;
+                    e.ui.win.close();
                 }
-                Ok(1) => true,
-                _ => false,
-            };
-            if close {
-                e.ed.borrow_mut().allow_close = true;
-                e.ui.win.close();
-            }
-        });
+            },
+        );
         glib::Propagation::Stop
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(bg: &ImageSurface) -> Doc {
+        Doc { bg: bg.clone(), shapes: Vec::new() }
+    }
+
+    #[test]
+    fn undo_history_counts_distinct_backgrounds() {
+        let a = ImageSurface::create(cairo::Format::ARgb32, 100, 100).unwrap();
+        let b = ImageSurface::create(cairo::Format::ARgb32, 50, 50).unwrap();
+        // shared with the current document: free
+        assert_eq!(history_bytes(&doc(&a), &[doc(&a), doc(&a)]), 0);
+        // counted once however many snapshots share it
+        assert_eq!(history_bytes(&doc(&a), &[doc(&b), doc(&b), doc(&a)]), 50 * 4 * 50);
+    }
+
+    #[test]
+    fn obfuscation_cache_reuses_and_is_bounded() {
+        let bg = ImageSurface::create(cairo::Format::ARgb32, 64, 64).unwrap();
+        let x = obfuscated(&bg, [0, 0, 32, 32, 4, 4]).unwrap();
+        let y = obfuscated(&bg, [0, 0, 32, 32, 4, 4]).unwrap();
+        assert_eq!(x.to_raw_none(), y.to_raw_none());
+        for i in 0..100 {
+            obfuscated(&bg, [i % 32, 0, 16, 16, 2, 2]).unwrap();
+        }
+        assert!(bg.user_data(&OBF_KEY).unwrap().0.borrow().len() <= OBF_CACHE_MAX);
+    }
+}

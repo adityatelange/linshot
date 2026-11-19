@@ -32,7 +32,9 @@ Works on **X11** and **Wayland** (GNOME, KDE Plasma, Cinnamon, and wlroots compo
 sudo apt install ./dist/linshot_0.1.0_amd64.deb
 ```
 
-Requires GTK ≥ 4.12: Ubuntu 24.04+, Debian 13+, or newer derivatives.
+Requires GTK ≥ 4.6 and glibc ≥ 2.35: Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS 22.04+,
+or newer derivatives. Use the `.deb` built for the oldest release you run (the 22.04 build also
+installs on 24.04 and Debian 12/13).
 
 ## Keyboard shortcuts
 
@@ -43,12 +45,14 @@ Requires GTK ≥ 4.12: Ubuntu 24.04+, Debian 13+, or newer derivatives.
 | Full screen   | Ctrl+Print     | `linshot full`             |
 | Last region   | Shift+Print    | `linshot last`             |
 
-Wayland does not allow apps to grab global keys. On **Wayfire** (via `wayfire.ini`), **Cinnamon** and **GNOME**, Linshot offers to
+Wayland does not allow apps to grab global keys. On **Wayfire** (via `wayfire.ini`), **Cinnamon**,
+**GNOME** (also Budgie, Unity) and **Xfce** (via `xfconf-query`), Linshot offers to
 register these shortcuts in the desktop's keyboard settings on first start (also in Preferences →
 Shortcuts) and frees Print from the built-in screenshot tool. Linshot then starts at login and
 re-applies its shortcuts if the session regenerates its config. On other desktops add them as custom
-shortcuts yourself. If your desktop already owns the Print key on X11, either free it or bind the
-commands the same way.
+shortcuts yourself; Preferences shows the lines to add for Sway, Hyprland, niri, river and labwc, and
+where to look on KDE Plasma, LXQt, MATE and COSMIC. If your desktop already owns the Print key on
+X11, either free it or bind the commands the same way.
 
 Editor keys: `S` select, `R` rect, `E` ellipse, `L` line, `A` arrow, `F` freehand, `T` text,
 `H` highlight, `O` pixelate, `B` blur, `I` counter, `C` crop (Enter applies), `Del` delete,
@@ -74,11 +78,14 @@ linshot [region|window|active|full|last|open FILE...|settings|quit] [-d SECONDS]
 ## Build
 
 ```bash
-sudo apt install cargo libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
+sudo apt install libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
+curl https://sh.rustup.rs -sSf | sh   # Rust ≥ 1.86; distro cargo is too old on 22.04/Debian 12
 packaging/build-deb.sh          # -> dist/linshot_<version>_<arch>.deb
 ```
 
-The `.deb` targets the architecture and distro release it is built on. CI builds amd64 and arm64.
+The `.deb` targets the architecture it is built on and every release at least as new as the build
+host. CI builds amd64 and arm64 packages on Ubuntu 22.04, which install on Ubuntu 22.04+ and
+Debian 12+.
 
 ## License
 
@@ -87,3 +94,6 @@ Copyright (C) 2026 Aditya Telange
 Linshot is free software: you can redistribute it and/or modify it under the terms of the
 GNU General Public License as published by the Free Software Foundation, either version 3 of
 the License, or (at your option) any later version. See [LICENSE](LICENSE).
+
+The `.deb` packages also include the licenses of the bundled Rust crates in
+`/usr/share/doc/linshot/THIRD-PARTY-LICENSES.gz`.

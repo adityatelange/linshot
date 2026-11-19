@@ -24,15 +24,14 @@ pub struct CursorImg {
 }
 
 pub fn is_wayland() -> bool {
-    std::env::var("XDG_SESSION_TYPE").map(|v| v.eq_ignore_ascii_case("wayland")).unwrap_or(false)
-        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    crate::session::kind() == crate::session::Kind::Wayland
 }
 
 pub fn is_x11() -> bool {
-    !is_wayland() && std::env::var_os("DISPLAY").is_some()
+    crate::session::kind() == crate::session::Kind::X11
 }
 
-fn has_cmd(name: &str) -> bool {
+pub(crate) fn has_cmd(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
         .unwrap_or(false)
@@ -84,6 +83,7 @@ pub fn grab_x11() -> Result<Grab, String> {
     let (w, h) = (screen.width_in_pixels, screen.height_in_pixels);
     let root = screen.root;
     let depth = screen.root_depth;
+    let t = std::time::Instant::now();
     let reply = conn
         .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, w, h, !0)
         .map_err(|e| e.to_string())?
@@ -96,25 +96,85 @@ pub fn grab_x11() -> Result<Grab, String> {
         .find(|f| f.depth == depth)
         .map(|f| f.bits_per_pixel)
         .unwrap_or(32);
-    if bpp != 32 {
-        return Err(format!("unsupported X11 pixel format ({bpp} bpp)"));
-    }
+    crate::trace("x11 GetImage", t);
+    let t = std::time::Instant::now();
+    // channel masks of the root visual: 0xff0000/0xff00/0xff for depth 24,
+    // 0x3ff00000/0xffc00/0x3ff for 30-bit deep colour, 565 for depth 16
+    let masks = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|d| d.visuals.iter())
+        .find(|v| v.visual_id == screen.root_visual)
+        .map(|v| [v.red_mask, v.green_mask, v.blue_mask])
+        .unwrap_or([0xff0000, 0xff00, 0xff]);
     let (w, h) = (w as i32, h as i32);
-    let stride = w * 4;
     let src_stride = reply.data.len() / h.max(1) as usize;
-    let mut data = vec![0u8; (stride * h) as usize];
-    let big_endian = conn.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::MSB_FIRST;
-    for y in 0..h as usize {
-        let src = &reply.data[y * src_stride..y * src_stride + (w as usize) * 4];
-        let dst = &mut data[y * stride as usize..(y + 1) * stride as usize];
-        for x in 0..w as usize {
-            let s = &src[x * 4..x * 4 + 4];
-            let (b, g, r) = if big_endian { (s[3], s[2], s[1]) } else { (s[0], s[1], s[2]) };
-            let px = 0xff00_0000u32 | (r as u32) << 16 | (g as u32) << 8 | b as u32;
-            dst[x * 4..x * 4 + 4].copy_from_slice(&px.to_ne_bytes());
+    let msb_first = conn.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::MSB_FIRST;
+    let data = x11_to_argb(reply.data, (w as usize, h as usize, src_stride), bpp, masks, msb_first)?;
+    crate::trace("x11 convert", t);
+    Ok(Grab::Pixels { width: w, height: h, stride: w * 4, data })
+}
+
+/// Converts a ZPixmap image (16, 24 or 32 bits per pixel, any channel masks)
+/// to opaque cairo ARGB32 in native byte order. When the layout already
+/// matches (BGRX in memory on a little-endian host, the usual case) the
+/// buffer is reused and only alpha is set.
+fn x11_to_argb(mut src: Vec<u8>, (w, h, src_stride): (usize, usize, usize), bpp: u8, masks: [u32; 3], msb_first: bool) -> Result<Vec<u8>, String> {
+    let bytes = match bpp {
+        16 | 24 | 32 => bpp as usize / 8,
+        _ => return Err(format!("unsupported X11 pixel format ({bpp} bpp)")),
+    };
+    if src_stride < w * bytes || src.len() < src_stride * h {
+        return Err("short X11 image".into());
+    }
+    let row = w * 4;
+    if bytes == 4 && !msb_first && masks == [0xff0000, 0xff00, 0xff] && cfg!(target_endian = "little") {
+        if src_stride != row {
+            // drop row padding in place
+            for y in 1..h {
+                src.copy_within(y * src_stride..y * src_stride + row, y * row);
+            }
+        }
+        src.truncate(row * h);
+        for px in src.chunks_exact_mut(4) {
+            px[3] = 0xff;
+        }
+        return Ok(src);
+    }
+    // (shift, bits) per channel
+    let chan = |m: u32| (m.trailing_zeros(), (m >> m.trailing_zeros()).trailing_ones());
+    let chans = masks.map(chan);
+    let to8 = |px: u32, (shift, bits): (u32, u32)| -> u32 {
+        let v = (px >> shift) & ((1u64 << bits) - 1) as u32;
+        match bits {
+            0 => 0,
+            8 => v,
+            b if b > 8 => v >> (b - 8),
+            b => (v * 255 + ((1 << b) - 1) / 2) / ((1 << b) - 1),
+        }
+    };
+    let mut out = vec![0u8; row * h];
+    if bytes == 4 && !msb_first && masks == [0xff0000, 0xff00, 0xff] {
+        // BGRX in memory, big-endian host
+        for (s, d) in src.chunks(src_stride).zip(out.chunks_exact_mut(row)) {
+            for (s, d) in s[..row].chunks_exact(4).zip(d.chunks_exact_mut(4)) {
+                let v = 0xff00_0000 | u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                d.copy_from_slice(&v.to_ne_bytes());
+            }
+        }
+        return Ok(out);
+    }
+    for (srow, drow) in src.chunks(src_stride).zip(out.chunks_exact_mut(row)) {
+        for (p, d) in srow[..w * bytes].chunks_exact(bytes).zip(drow.chunks_exact_mut(4)) {
+            let px = p.iter().enumerate().fold(0u32, |acc, (i, &b)| {
+                let sh = if msb_first { (bytes - 1 - i) * 8 } else { i * 8 };
+                acc | (b as u32) << sh
+            });
+            let v = 0xff00_0000 | to8(px, chans[0]) << 16 | to8(px, chans[1]) << 8 | to8(px, chans[2]);
+            d.copy_from_slice(&v.to_ne_bytes());
         }
     }
-    Ok(Grab::Pixels { width: w, height: h, stride, data })
+    Ok(out)
 }
 
 /// The current pointer image and position (XFixes).
@@ -142,13 +202,10 @@ fn x11_cursor() -> Result<CursorImg, Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------- Wayland
 
 fn grab_wayland(interactive: bool, cursor: bool) -> Result<Grab, String> {
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
-    let wlroots = ["sway", "hyprland", "river", "wlroots", "wayfire", "labwc", "niri", "dwl"]
-        .iter()
-        .any(|d| desktop.contains(d));
+    let wlroots = crate::session::is_wlroots();
     let mut errors = Vec::new();
 
-    if desktop.contains("cinnamon") && !interactive {
+    if crate::session::desktop_is("cinnamon") && !interactive {
         match cinnamon_screenshot(cursor) {
             Ok(g) => return Ok(g),
             Err(e) => errors.push(format!("cinnamon: {e}")),
@@ -195,12 +252,29 @@ fn run_tool(cmd: &[&str], path_last: bool) -> Result<Grab, String> {
     if path_last {
         c.arg(&out);
     }
-    let status = c
+    let mut child = c
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| format!("{}: {e}", cmd[0]))?;
+    // a tool that hangs (e.g. waiting for a dialog nobody sees) must not block captures forever
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if start.elapsed() < TOOL_TIMEOUT => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let Some(status) = status else {
+        let _ = std::fs::remove_file(&out);
+        return Err(format!("{} timed out", cmd[0]));
+    };
     if status.success() && out.is_file() {
         Ok(Grab::File(out))
     } else {
@@ -209,8 +283,39 @@ fn run_tool(cmd: &[&str], path_last: bool) -> Result<Grab, String> {
     }
 }
 
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Runs `f` on a helper thread and stops waiting after `limit`, so a D-Bus
+/// peer that never answers cannot block captures forever. A result that
+/// arrives too late is handed to `late` (to clean up files).
+fn with_timeout<T: Send + 'static>(
+    limit: std::time::Duration,
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+    late: impl FnOnce(T) + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::SendError(Ok(v))) = tx.send(f()) {
+            late(v);
+        }
+    });
+    match rx.recv_timeout(limit) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!("no answer within {} s", limit.as_secs())),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("helper thread failed".into()),
+    }
+}
+
 /// Cinnamon's own screenshot D-Bus API (org.Cinnamon.Screenshot).
 fn cinnamon_screenshot(cursor: bool) -> Result<Grab, String> {
+    with_timeout(std::time::Duration::from_secs(10), move || cinnamon_screenshot_impl(cursor), |g| {
+        if let Grab::File(p) = g {
+            let _ = std::fs::remove_file(p);
+        }
+    })
+}
+
+fn cinnamon_screenshot_impl(cursor: bool) -> Result<Grab, String> {
     let conn = zbus::blocking::Connection::session().map_err(|e| e.to_string())?;
     let out = tmp_png();
     let path = out.to_string_lossy().into_owned();
@@ -234,7 +339,16 @@ fn cinnamon_screenshot(cursor: bool) -> Result<Grab, String> {
 }
 
 /// org.freedesktop.portal.Screenshot. Returns the path of the saved PNG.
+/// Gives up when the portal does not answer (broken or missing backend); the
+/// interactive picker gets longer since the user is choosing a window.
 fn portal_screenshot(interactive: bool) -> Result<PathBuf, String> {
+    let limit = std::time::Duration::from_secs(if interactive { 300 } else { 60 });
+    with_timeout(limit, move || portal_screenshot_impl(interactive), |p| {
+        let _ = std::fs::remove_file(p);
+    })
+}
+
+fn portal_screenshot_impl(interactive: bool) -> Result<PathBuf, String> {
     use zbus::blocking::{Connection, Proxy};
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -289,7 +403,7 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(v);
                 i += 3;
                 continue;
@@ -405,4 +519,88 @@ pub fn x11_active_window() -> Option<(i32, i32, i32, i32)> {
         return None;
     }
     window_rect(&conn, root, w, atom("_NET_FRAME_EXTENTS")?, atom("_GTK_FRAME_EXTENTS")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn px(v: &[u8], i: usize) -> u32 {
+        u32::from_ne_bytes([v[i * 4], v[i * 4 + 1], v[i * 4 + 2], v[i * 4 + 3]])
+    }
+
+    fn conv(src: &[u8], w: usize, bpp: u8, masks: [u32; 3], msb: bool) -> Vec<u32> {
+        let bytes = bpp as usize / 8;
+        x11_to_argb(src.to_vec(), (w, 1, w * bytes), bpp, masks, msb)
+            .unwrap()
+            .chunks(4)
+            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn x11_pixel_formats() {
+        let rgb24 = [0xff0000, 0xff00, 0xff];
+        // depth 24 in 32 bpp, little and big endian servers
+        assert_eq!(conv(&[0x30, 0x20, 0x10, 0x00], 1, 32, rgb24, false), vec![0xff102030]);
+        assert_eq!(conv(&[0x00, 0x10, 0x20, 0x30], 1, 32, rgb24, true), vec![0xff102030]);
+        // depth 30: 10 bits per channel
+        let v: u32 = 0x3ff << 20 | 0x200 << 10 | 0x004;
+        assert_eq!(conv(&v.to_le_bytes(), 1, 32, [0x3ff0_0000, 0xffc00, 0x3ff], false), vec![0xffff8001]);
+        // depth 16, 565: white and pure green
+        assert_eq!(conv(&[0xff, 0xff, 0xe0, 0x07], 2, 16, [0xf800, 0x7e0, 0x1f], false), vec![0xffffffff, 0xff00ff00]);
+        // 24 bpp packed
+        assert_eq!(conv(&[0x30, 0x20, 0x10], 1, 24, rgb24, false), vec![0xff102030]);
+        assert!(x11_to_argb(vec![0], (1, 1, 1), 8, rgb24, false).is_err());
+    }
+
+    #[test]
+    fn x11_conversion() {
+        // 2x2, optionally padded rows; pixel i = (r, g, b) = (10*i, 20+i, 30+i)
+        for &(big, pad) in &[(false, 0usize), (false, 4), (true, 0), (true, 4)] {
+            let stride = 8 + pad;
+            let mut src = vec![0u8; stride * 2];
+            for i in 0..4 {
+                let (r, g, b) = (10 * i as u8, 20 + i as u8, 30 + i as u8);
+                let o = (i / 2) * stride + (i % 2) * 4;
+                let bytes = if big { [0x55, r, g, b] } else { [b, g, r, 0x55] };
+                src[o..o + 4].copy_from_slice(&bytes);
+            }
+            let out = x11_to_argb(src, (2, 2, stride), 32, [0xff0000, 0xff00, 0xff], big).unwrap();
+            assert_eq!(out.len(), 16);
+            for i in 0..4u32 {
+                assert_eq!(px(&out, i as usize), 0xff00_0000 | (10 * i) << 16 | (20 + i) << 8 | (30 + i), "big={big} pad={pad}");
+            }
+        }
+    }
+
+    #[test]
+    fn percent_decoding() {
+        assert_eq!(percent_decode("/tmp/a%20b%C3%A9.png"), "/tmp/a bé.png");
+        assert_eq!(percent_decode("/x%2"), "/x%2");
+        assert_eq!(percent_decode("/%é/%zz"), "/%é/%zz");
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn with_timeout_returns_and_cleans_up_late_results() {
+        assert_eq!(with_timeout(Duration::from_secs(5), || Ok(7), |_| {}), Ok(7));
+        assert!(with_timeout(Duration::from_secs(5), || Err::<i32, _>("x".into()), |_| {}).is_err());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = with_timeout(
+            Duration::from_millis(20),
+            || {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(42)
+            },
+            move |v| tx.send(v).unwrap(),
+        );
+        assert!(r.unwrap_err().contains("no answer"));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(42));
+    }
 }
