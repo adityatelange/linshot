@@ -109,8 +109,77 @@ struct Shot {
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub fn grab(cursor: bool) -> Result<Grab, String> {
-    grab_impl(cursor).map_err(|e| e.to_string())
+/// Captures without the pointer, and (if asked) a second frame with it; the
+/// difference between the two is the pointer, returned as a separate sprite.
+pub fn grab_split(cursor: bool) -> Result<(Grab, Option<crate::capture::CursorImg>), String> {
+    let base = grab_impl(false).map_err(|e| e.to_string())?;
+    if !cursor {
+        return Ok((base, None));
+    }
+    let with = grab_impl(true).map_err(|e| e.to_string())?;
+    match extract_cursor(&base, &with) {
+        Some(c) => Ok((base, Some(c))),
+        // content changed between frames: keep the pointer painted in
+        None if differs(&base, &with) => Ok((with, None)),
+        None => Ok((base, None)),
+    }
+}
+
+fn pixels(g: &Grab) -> Option<(i32, i32, i32, &[u8])> {
+    match g {
+        Grab::Pixels { width, height, stride, data } => Some((*width, *height, *stride, data)),
+        _ => None,
+    }
+}
+
+fn differs(a: &Grab, b: &Grab) -> bool {
+    match (pixels(a), pixels(b)) {
+        (Some(x), Some(y)) => x.3 != y.3,
+        _ => false,
+    }
+}
+
+fn extract_cursor(base: &Grab, with: &Grab) -> Option<crate::capture::CursorImg> {
+    let (w, h, stride, a) = pixels(base)?;
+    let (w2, h2, stride2, b) = pixels(with)?;
+    if (w, h, stride) != (w2, h2, stride2) {
+        return None;
+    }
+    let px = |d: &[u8], x: i32, y: i32| -> u32 {
+        let o = (y * stride + x * 4) as usize;
+        u32::from_ne_bytes(d[o..o + 4].try_into().unwrap())
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, -1, -1);
+    for y in 0..h {
+        let o = (y * stride) as usize;
+        if a[o..o + (w * 4) as usize] == b[o..o + (w * 4) as usize] {
+            continue;
+        }
+        for x in 0..w {
+            if px(a, x, y) != px(b, x, y) {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < 0 {
+        return None; // pointer hidden
+    }
+    let (cw, ch) = (x1 - x0 + 1, y1 - y0 + 1);
+    if cw > 256 || ch > 256 {
+        return None; // something else changed on screen
+    }
+    let mut data = Vec::with_capacity((cw * ch * 4) as usize);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (pa, pb) = (px(a, x, y), px(b, x, y));
+            let v = if pa == pb { 0u32 } else { pb | 0xff00_0000 };
+            data.extend_from_slice(&v.to_ne_bytes());
+        }
+    }
+    Some(crate::capture::CursorImg { x: x0, y: y0, w: cw, h: ch, data })
 }
 
 fn grab_impl(cursor: bool) -> Res<Grab> {

@@ -13,6 +13,16 @@ pub enum Grab {
     File(PathBuf),
 }
 
+/// The mouse pointer captured separately so it can be moved in the editor.
+/// Position is in screenshot pixels; data is premultiplied BGRA (cairo ARGB32).
+pub struct CursorImg {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub data: Vec<u8>,
+}
+
 pub fn is_wayland() -> bool {
     std::env::var("XDG_SESSION_TYPE").map(|v| v.eq_ignore_ascii_case("wayland")).unwrap_or(false)
         || std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -39,17 +49,33 @@ fn tmp_png() -> PathBuf {
 
 /// Grab the entire desktop. `interactive` asks the portal to let the user pick
 /// (used for window capture on Wayland).
-pub fn grab(interactive: bool, cursor: bool) -> Result<Grab, String> {
+/// Grab the screen. When `cursor` is set the pointer comes back separately
+/// where the backend allows it (X11, wlroots); other backends paint it in.
+pub fn grab(interactive: bool, cursor: bool) -> Result<(Grab, Option<CursorImg>), String> {
     if is_wayland() {
+        let mut first_err = None;
+        if !interactive {
+            match crate::wlr::grab_split(cursor) {
+                Ok(r) => return Ok(r),
+                Err(e) => first_err = Some(format!("wlr-screencopy: {e}")),
+            }
+        }
         grab_wayland(interactive, cursor)
+            .map(|g| (g, None))
+            .map_err(|e| match first_err {
+                Some(f) => format!("{f}; {e}"),
+                None => e,
+            })
     } else {
-        grab_x11(cursor)
+        let g = grab_x11()?;
+        let c = if cursor { x11_cursor().ok() } else { None };
+        Ok((g, c))
     }
 }
 
 // ---------------------------------------------------------------- X11
 
-pub fn grab_x11(cursor: bool) -> Result<Grab, String> {
+pub fn grab_x11() -> Result<Grab, String> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
@@ -88,41 +114,29 @@ pub fn grab_x11(cursor: bool) -> Result<Grab, String> {
             dst[x * 4..x * 4 + 4].copy_from_slice(&px.to_ne_bytes());
         }
     }
-    if cursor {
-        let _ = draw_x11_cursor(&conn, &mut data, w, h);
-    }
     Ok(Grab::Pixels { width: w, height: h, stride, data })
 }
 
-/// Composites the current pointer image (XFixes) onto BGRA pixels.
-fn draw_x11_cursor(conn: &impl x11rb::connection::Connection, data: &mut [u8], w: i32, h: i32) -> Result<(), Box<dyn std::error::Error>> {
+/// The current pointer image and position (XFixes).
+fn x11_cursor() -> Result<CursorImg, Box<dyn std::error::Error>> {
     use x11rb::protocol::xfixes::ConnectionExt;
+    let (conn, _) = x11rb::connect(None)?;
     conn.xfixes_query_version(5, 0)?.reply()?;
     let c = conn.xfixes_get_cursor_image()?.reply()?;
-    let (ox, oy) = (c.x as i32 - c.xhot as i32, c.y as i32 - c.yhot as i32);
-    for cy in 0..c.height as i32 {
-        for cx in 0..c.width as i32 {
-            let (x, y) = (ox + cx, oy + cy);
-            if x < 0 || y < 0 || x >= w || y >= h {
-                continue;
-            }
-            let src = c.cursor_image[(cy * c.width as i32 + cx) as usize]; // premultiplied ARGB
-            let a = src >> 24;
-            if a == 0 {
-                continue;
-            }
-            let off = ((y * w + x) * 4) as usize;
-            let dst = u32::from_ne_bytes(data[off..off + 4].try_into()?);
-            let mix = |sh: u32| -> u32 {
-                let s = (src >> sh) & 0xff;
-                let d = (dst >> sh) & 0xff;
-                (s + d * (255 - a) / 255).min(255)
-            };
-            let px = 0xff00_0000 | mix(16) << 16 | mix(8) << 8 | mix(0);
-            data[off..off + 4].copy_from_slice(&px.to_ne_bytes());
-        }
+    let mut data = Vec::with_capacity(c.cursor_image.len() * 4);
+    for px in &c.cursor_image {
+        data.extend_from_slice(&px.to_ne_bytes()); // premultiplied ARGB, same as cairo
     }
-    Ok(())
+    if c.width == 0 || c.height == 0 {
+        return Err("no cursor".into());
+    }
+    Ok(CursorImg {
+        x: c.x as i32 - c.xhot as i32,
+        y: c.y as i32 - c.yhot as i32,
+        w: c.width as i32,
+        h: c.height as i32,
+        data,
+    })
 }
 
 // ---------------------------------------------------------------- Wayland
@@ -134,13 +148,6 @@ fn grab_wayland(interactive: bool, cursor: bool) -> Result<Grab, String> {
         .any(|d| desktop.contains(d));
     let mut errors = Vec::new();
 
-    // wlroots compositors (Wayfire, Sway, Hyprland, labwc, ...): native, no helper needed
-    if !interactive {
-        match crate::wlr::grab(cursor) {
-            Ok(g) => return Ok(g),
-            Err(e) => errors.push(format!("wlr-screencopy: {e}")),
-        }
-    }
     if desktop.contains("cinnamon") && !interactive {
         match cinnamon_screenshot(cursor) {
             Ok(g) => return Ok(g),

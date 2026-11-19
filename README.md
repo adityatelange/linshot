@@ -7,7 +7,8 @@
 A screenshot and annotation tool for Linux, written in Rust + GTK 4.
 Works on **X11** and **Wayland** (GNOME, KDE Plasma, Cinnamon, and wlroots compositors such as Wayfire, Sway, Hyprland, labwc).
 
-![Editor](docs/editor.png)
+![Editor (dark)](docs/editor.png)
+![Editor (light)](docs/editor-light.png)
 
 | Region selection | Launcher |
 |---|---|
@@ -21,7 +22,7 @@ Works on **X11** and **Wayland** (GNOME, KDE Plasma, Cinnamon, and wlroots compo
 - **Editor:** rectangle, ellipse, line, arrow, freehand, text, highlighter, pixelate, blur,
   numbered step counters, crop; select/move/delete, per-shape colour/fill/width/font/shadow,
   undo/redo, zoom
-- **Mouse pointer** included in captures (optional)
+- **Mouse pointer** captured as a movable object in the editor (X11, wlroots), or painted in (optional)
 - **Output:** save (PNG/JPEG, filename pattern), save as, copy to clipboard, print, open existing images
 - **Tray icon** (StatusNotifierItem), single instance, notifications, autostart option
 
@@ -44,7 +45,8 @@ Requires GTK ≥ 4.12: Ubuntu 24.04+, Debian 13+, or newer derivatives.
 
 Wayland does not allow apps to grab global keys. On **Wayfire** (via `wayfire.ini`), **Cinnamon** and **GNOME**, Linshot offers to
 register these shortcuts in the desktop's keyboard settings on first start (also in Preferences →
-Shortcuts) and frees Print from the built-in screenshot tool. On other desktops add them as custom
+Shortcuts) and frees Print from the built-in screenshot tool. Linshot then starts at login and
+re-applies its shortcuts if the session regenerates its config. On other desktops add them as custom
 shortcuts yourself. If your desktop already owns the Print key on X11, either free it or bind the
 commands the same way.
 

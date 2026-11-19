@@ -36,6 +36,8 @@ pub struct Config {
     /// asked once whether to register desktop shortcuts
     pub shortcuts_prompted: bool,
     pub capture_cursor: bool,
+    /// user wants Linshot's shortcuts in the desktop config (re-applied if lost)
+    pub desktop_shortcuts: Option<bool>,
 }
 
 impl Default for Config {
@@ -53,7 +55,7 @@ impl Default for Config {
             magnifier: true,
             hotkeys: true,
             last_region: None,
-            line_color: [0.90, 0.16, 0.16, 1.0],
+            line_color: [0.937, 0.267, 0.267, 1.0],
             fill_color: [1.0, 1.0, 1.0, 1.0],
             fill_enabled: false,
             line_width: 3.0,
@@ -62,6 +64,7 @@ impl Default for Config {
             theme: "system".into(),
             shortcuts_prompted: false,
             capture_cursor: true,
+            desktop_shortcuts: None,
         }
     }
 }

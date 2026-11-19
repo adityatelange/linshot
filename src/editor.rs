@@ -27,6 +27,8 @@ pub enum Tool {
     Blur,
     Counter,
     Crop,
+    /// captured mouse pointer (movable sprite)
+    Pointer,
 }
 
 const TOOLS: &[(Tool, &str, &str, char)] = &[
@@ -59,6 +61,7 @@ pub struct Shape {
     shadow: bool,
     text: String,
     num: u32,
+    sprite: Option<ImageSurface>,
 }
 
 impl Shape {
@@ -274,6 +277,12 @@ fn draw_shape(cr: &cairo::Context, s: &Shape, bg: &ImageSurface) {
             cr.move_to(s.a.0 - w as f64 / 2.0, s.a.1 - h as f64 / 2.0);
             pangocairo::functions::show_layout(cr, &l);
         }
+        Tool::Pointer => {
+            if let Some(sp) = &s.sprite {
+                cr.set_source_surface(sp, s.a.0, s.a.1).ok();
+                cr.paint().ok();
+            }
+        }
         Tool::Select | Tool::Crop => {}
     }
     cr.restore().ok();
@@ -396,26 +405,63 @@ impl Ed {
             shadow: st.shadow,
             text: String::new(),
             num: 0,
+            sprite: None,
         }
     }
+}
+
+/// Space around the image on the canvas (logical px).
+const PAD: f64 = 40.0;
+/// Room kept free for the floating dock (left) and property bar (bottom).
+const DOCK_W: i32 = 76;
+const BAR_H: i32 = 72;
+
+const PALETTE: [[f64; 4]; 8] = [
+    [0.937, 0.267, 0.267, 1.0],
+    [0.976, 0.451, 0.086, 1.0],
+    [0.980, 0.800, 0.082, 1.0],
+    [0.133, 0.773, 0.369, 1.0],
+    [0.231, 0.510, 0.965, 1.0],
+    [0.659, 0.333, 0.969, 1.0],
+    [0.067, 0.094, 0.153, 1.0],
+    [1.0, 1.0, 1.0, 1.0],
+];
+
+struct Groups {
+    color: gtk::Box,
+    fill: gtk::Box,
+    width: gtk::Box,
+    font: gtk::Box,
+    shadow: gtk::Box,
+    hint: gtk::Label,
+    sep1: gtk::Separator,
+    sep2: gtk::Separator,
 }
 
 struct Ui {
     win: gtk::ApplicationWindow,
     area: gtk::DrawingArea,
     scroller: gtk::ScrolledWindow,
-    status: gtk::Label,
-    crop_btn: gtk::Button,
+    subtitle: gtk::Label,
+    zoom_label: gtk::Label,
+    crop_bar: gtk::Box,
+    toast: gtk::Revealer,
+    toast_label: gtk::Label,
+    toast_gen: Cell<u32>,
     undo_btn: gtk::Button,
     redo_btn: gtk::Button,
     del_btn: gtk::Button,
     tools: Vec<(Tool, gtk::ToggleButton)>,
     color: gtk::ColorDialogButton,
+    swatches: Vec<gtk::Button>,
     fill: gtk::ColorDialogButton,
-    fill_chk: gtk::CheckButton,
-    width: gtk::SpinButton,
+    fill_chk: gtk::ToggleButton,
+    width: gtk::Scale,
+    width_cap: gtk::Label,
+    width_val: gtk::Label,
     font: gtk::SpinButton,
-    shadow: gtk::CheckButton,
+    shadow: gtk::ToggleButton,
+    groups: Groups,
 }
 
 pub struct Editor {
@@ -423,6 +469,7 @@ pub struct Editor {
     ui: Ui,
     ctx: Rc<Ctx>,
     syncing: Cell<bool>,
+    last_style_ckpt: Cell<Option<std::time::Instant>>,
 }
 
 thread_local! {
@@ -439,146 +486,426 @@ fn from_rgba(c: &gdk::RGBA) -> [f64; 4] {
 fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     let b = gtk::Button::from_icon_name(icon);
     b.set_tooltip_text(Some(tip));
+    b.add_css_class("flat");
     b
 }
 
-pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
+/// Crisp, theme-coloured tool glyphs drawn with cairo.
+fn glyph(kind: Tool, size: i32) -> gtk::DrawingArea {
+    let a = gtk::DrawingArea::new();
+    a.set_content_width(size);
+    a.set_content_height(size);
+    a.set_can_target(false);
+    a.set_draw_func(move |w, cr, width, _| {
+        let c = w.color();
+        let s = width as f64 / 20.0;
+        cr.scale(s, s);
+        cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+        cr.set_line_width(1.7);
+        cr.set_line_cap(cairo::LineCap::Round);
+        cr.set_line_join(cairo::LineJoin::Round);
+        let stroke = |cr: &cairo::Context| {
+            cr.stroke().ok();
+        };
+        match kind {
+            Tool::Select | Tool::Pointer => {
+                cr.move_to(5.5, 3.0);
+                cr.line_to(5.5, 16.0);
+                cr.line_to(8.8, 12.8);
+                cr.line_to(11.2, 17.8);
+                cr.line_to(13.3, 16.8);
+                cr.line_to(10.9, 11.9);
+                cr.line_to(15.2, 11.9);
+                cr.close_path();
+                cr.fill().ok();
+            }
+            Tool::Rect => {
+                rounded(cr, 3.5, 5.0, 13.0, 10.0, 2.0);
+                stroke(cr);
+            }
+            Tool::Ellipse => {
+                cr.save().ok();
+                cr.translate(10.0, 10.0);
+                cr.scale(7.0, 5.5);
+                cr.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+                cr.restore().ok();
+                stroke(cr);
+            }
+            Tool::Line => {
+                cr.move_to(4.0, 16.0);
+                cr.line_to(16.0, 4.0);
+                stroke(cr);
+            }
+            Tool::Arrow => {
+                cr.move_to(4.0, 16.0);
+                cr.line_to(15.5, 4.5);
+                cr.move_to(9.5, 4.0);
+                cr.line_to(16.0, 4.0);
+                cr.line_to(16.0, 10.5);
+                stroke(cr);
+            }
+            Tool::Pen => {
+                cr.move_to(3.0, 15.0);
+                cr.curve_to(5.5, 7.0, 8.5, 18.0, 11.5, 10.0);
+                cr.curve_to(13.0, 6.0, 15.0, 7.0, 17.0, 4.5);
+                stroke(cr);
+            }
+            Tool::Text => {
+                cr.set_line_width(2.0);
+                cr.move_to(4.5, 5.0);
+                cr.line_to(15.5, 5.0);
+                cr.move_to(10.0, 5.0);
+                cr.line_to(10.0, 16.0);
+                stroke(cr);
+            }
+            Tool::Highlight => {
+                cr.move_to(6.0, 12.5);
+                cr.line_to(12.0, 3.5);
+                cr.line_to(16.0, 6.3);
+                cr.line_to(10.0, 15.3);
+                cr.close_path();
+                stroke(cr);
+                cr.set_line_width(3.0);
+                cr.move_to(3.5, 17.5);
+                cr.line_to(16.5, 17.5);
+                cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, 0.45);
+                stroke(cr);
+            }
+            Tool::Pixelate => {
+                for (i, (x, y)) in [(3.0, 3.0), (8.0, 3.0), (13.0, 3.0), (3.0, 8.0), (8.0, 8.0), (13.0, 8.0), (3.0, 13.0), (8.0, 13.0), (13.0, 13.0)]
+                    .iter()
+                    .enumerate()
+                {
+                    let alpha = if i % 2 == 0 { 1.0 } else { 0.4 };
+                    cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, alpha);
+                    rounded(cr, *x, *y, 4.2, 4.2, 1.0);
+                    cr.fill().ok();
+                }
+            }
+            Tool::Blur => {
+                for (r, a) in [(3.0, 1.0), (5.6, 0.55), (8.0, 0.25)] {
+                    cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, a);
+                    cr.arc(10.0, 10.0, r, 0.0, std::f64::consts::TAU);
+                    if r < 4.0 {
+                        cr.fill().ok();
+                    } else {
+                        stroke(cr);
+                    }
+                }
+            }
+            Tool::Counter => {
+                cr.arc(10.0, 10.0, 7.5, 0.0, std::f64::consts::TAU);
+                stroke(cr);
+                cr.move_to(8.3, 7.6);
+                cr.line_to(10.6, 6.0);
+                cr.line_to(10.6, 14.2);
+                stroke(cr);
+            }
+            Tool::Crop => {
+                cr.move_to(6.0, 2.5);
+                cr.line_to(6.0, 14.0);
+                cr.line_to(17.5, 14.0);
+                cr.move_to(2.5, 6.0);
+                cr.line_to(14.0, 6.0);
+                cr.line_to(14.0, 17.5);
+                stroke(cr);
+            }
+        }
+    });
+    a
+}
+
+/// Small glyphs for the property bar.
+fn prop_glyph(name: &'static str) -> gtk::DrawingArea {
+    let a = gtk::DrawingArea::new();
+    a.set_content_width(18);
+    a.set_content_height(18);
+    a.set_can_target(false);
+    a.set_draw_func(move |w, cr, width, _| {
+        let c = w.color();
+        cr.scale(width as f64 / 20.0, width as f64 / 20.0);
+        cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+        cr.set_line_width(1.7);
+        match name {
+            "fill" => {
+                rounded(cr, 3.5, 3.5, 13.0, 13.0, 3.0);
+                cr.stroke_preserve().ok();
+                cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, 0.45);
+                cr.fill().ok();
+            }
+            _ => {
+                // shadow
+                cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, 0.4);
+                rounded(cr, 6.0, 6.0, 11.0, 11.0, 2.5);
+                cr.fill().ok();
+                cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+                rounded(cr, 3.0, 3.0, 11.0, 11.0, 2.5);
+                cr.stroke().ok();
+            }
+        }
+    });
+    a
+}
+
+fn cap(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.add_css_class("ls-cap");
+    l
+}
+
+fn hbox(spacing: i32) -> gtk::Box {
+    gtk::Box::new(gtk::Orientation::Horizontal, spacing)
+}
+
+pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Option<(ImageSurface, f64, f64)>) {
     let cfg = ctx.cfg.borrow().clone();
+    let title_text = title.unwrap_or_else(|| "Screenshot".into());
     let win = gtk::ApplicationWindow::builder()
         .application(&ctx.app)
-        .title(title.unwrap_or_else(|| "Linshot".into()))
+        .title(format!("{title_text} — Linshot"))
         .icon_name("linshot")
         .build();
+    win.add_css_class("ls-editor");
 
-    // ---- header bar
+    // ---------------------------------------------------------------- header
     let header = gtk::HeaderBar::new();
-    let save_btn = icon_button("document-save-symbolic", "Save (Ctrl+S)");
-    let save_as_btn = icon_button("document-save-as-symbolic", "Save as… (Ctrl+Shift+S)");
-    let copy_btn = icon_button("edit-copy-symbolic", "Copy image to clipboard (Ctrl+C)");
-    let print_btn = icon_button("document-print-symbolic", "Print (Ctrl+P)");
+    let tbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    tbox.set_valign(gtk::Align::Center);
+    let tlabel = gtk::Label::new(Some(&title_text));
+    tlabel.add_css_class("ls-title");
+    tlabel.set_ellipsize(pango::EllipsizeMode::Middle);
+    tlabel.set_max_width_chars(40);
+    let subtitle = gtk::Label::new(None);
+    subtitle.add_css_class("ls-subtitle");
+    tbox.append(&tlabel);
+    tbox.append(&subtitle);
+    header.set_title_widget(Some(&tbox));
+
+    let open_btn = icon_button("document-open-symbolic", "Open image (Ctrl+O)");
     let undo_btn = icon_button("edit-undo-symbolic", "Undo (Ctrl+Z)");
     let redo_btn = icon_button("edit-redo-symbolic", "Redo (Ctrl+Y)");
-    let del_btn = icon_button("edit-delete-symbolic", "Delete selected (Del)");
-    let zoom_out = icon_button("zoom-out-symbolic", "Zoom out (Ctrl+-)");
-    let zoom_fit = icon_button("zoom-fit-best-symbolic", "Best fit (Ctrl+0)");
-    let zoom_100 = icon_button("zoom-original-symbolic", "Actual size (Ctrl+1)");
-    let zoom_in = icon_button("zoom-in-symbolic", "Zoom in (Ctrl++)");
-    let open_btn = icon_button("document-open-symbolic", "Open image… (Ctrl+O)");
-    for b in [&open_btn, &save_btn, &save_as_btn, &copy_btn, &print_btn] {
-        header.pack_start(b);
-    }
-    let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    zoom_box.add_css_class("linked");
-    for b in [&zoom_out, &zoom_fit, &zoom_100, &zoom_in] {
-        zoom_box.append(b);
-    }
-    header.pack_end(&zoom_box);
-    header.pack_end(&del_btn);
-    header.pack_end(&redo_btn);
-    header.pack_end(&undo_btn);
+    header.pack_start(&open_btn);
+    header.pack_start(&undo_btn);
+    header.pack_start(&redo_btn);
+
+    let menu = gio::Menu::new();
+    let sec1 = gio::Menu::new();
+    sec1.append(Some("Save As…"), Some("win.save-as"));
+    sec1.append(Some("Print…"), Some("win.print"));
+    menu.append_section(None, &sec1);
+    let sec2 = gio::Menu::new();
+    sec2.append(Some("New capture"), Some("win.capture"));
+    sec2.append(Some("Preferences"), Some("win.prefs"));
+    menu.append_section(None, &sec2);
+    let menu_btn = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .tooltip_text("More")
+        .build();
+    menu_btn.add_css_class("flat");
+    let save_btn = gtk::Button::with_label("Save");
+    save_btn.add_css_class("ls-primary");
+    save_btn.set_tooltip_text(Some("Save to the screenshots folder (Ctrl+S)"));
+    let copy_btn = gtk::Button::new();
+    let cb = hbox(6);
+    cb.append(&gtk::Image::from_icon_name("edit-copy-symbolic"));
+    cb.append(&gtk::Label::new(Some("Copy")));
+    copy_btn.set_child(Some(&cb));
+    copy_btn.add_css_class("ls-soft");
+    copy_btn.set_tooltip_text(Some("Copy image to clipboard (Ctrl+C)"));
+    header.pack_end(&menu_btn);
+    header.pack_end(&save_btn);
+    header.pack_end(&copy_btn);
     win.set_titlebar(Some(&header));
 
-    // ---- property bar
-    let props = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    props.set_margin_start(8);
-    props.set_margin_end(8);
-    props.set_margin_top(4);
-    props.set_margin_bottom(4);
-    let dialog = gtk::ColorDialog::builder().with_alpha(true).build();
-    let color = gtk::ColorDialogButton::new(Some(dialog.clone()));
-    color.set_rgba(&to_rgba(cfg.line_color));
-    color.set_tooltip_text(Some("Line / text colour"));
-    let fill = gtk::ColorDialogButton::new(Some(dialog));
-    fill.set_rgba(&to_rgba(cfg.fill_color));
-    fill.set_tooltip_text(Some("Fill colour"));
-    let fill_chk = gtk::CheckButton::with_label("Fill");
-    fill_chk.set_active(cfg.fill_enabled);
-    let width = gtk::SpinButton::with_range(1.0, 30.0, 1.0);
-    width.set_value(cfg.line_width);
-    width.set_tooltip_text(Some("Line width (also obfuscation strength)"));
-    let font = gtk::SpinButton::with_range(6.0, 120.0, 1.0);
-    font.set_value(cfg.font_size);
-    font.set_tooltip_text(Some("Font size (text and counters)"));
-    let shadow = gtk::CheckButton::with_label("Shadow");
-    shadow.set_active(cfg.shadow);
-    let crop_btn = gtk::Button::with_label("✔ Apply crop");
-    crop_btn.set_tooltip_text(Some("Apply crop (Enter) · Esc cancels"));
-    crop_btn.add_css_class("suggested-action");
-    crop_btn.set_visible(false);
-    props.append(&gtk::Label::new(Some("Colour")));
-    props.append(&color);
-    props.append(&fill_chk);
-    props.append(&fill);
-    props.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    props.append(&gtk::Label::new(Some("Width")));
-    props.append(&width);
-    props.append(&gtk::Label::new(Some("Font")));
-    props.append(&font);
-    props.append(&shadow);
-    props.append(&crop_btn);
+    // ---------------------------------------------------------------- canvas
+    let area = gtk::DrawingArea::new();
+    area.set_halign(gtk::Align::Center);
+    area.set_valign(gtk::Align::Center);
+    area.set_focusable(true);
+    area.set_margin_start(DOCK_W);
+    area.set_margin_bottom(BAR_H);
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_child(Some(&area));
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.add_css_class("ls-canvas");
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&scroller));
 
-    // ---- tools
-    let toolbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    toolbox.set_margin_start(4);
-    toolbox.set_margin_end(4);
-    toolbox.set_margin_top(4);
+    // ---------------------------------------------------------------- tool dock
+    let dock = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    dock.add_css_class("ls-dock");
+    dock.set_halign(gtk::Align::Start);
+    dock.set_valign(gtk::Align::Center);
+    dock.set_margin_start(14);
+    dock.set_margin_bottom(BAR_H / 2);
     let mut tools = Vec::new();
     let mut first: Option<gtk::ToggleButton> = None;
-    for (t, glyph, tip, _) in TOOLS {
-        let b = gtk::ToggleButton::with_label(glyph);
+    for (t, _, tip, _) in TOOLS {
+        if matches!(t, Tool::Rect | Tool::Text | Tool::Crop) {
+            dock.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
+        let b = gtk::ToggleButton::new();
+        b.set_child(Some(&glyph(*t, 20)));
         b.set_tooltip_text(Some(tip));
-        b.add_css_class("flat");
-        b.set_size_request(36, 36);
+        b.add_css_class("ls-tool");
         if let Some(f) = &first {
             b.set_group(Some(f));
         } else {
             first = Some(b.clone());
         }
-        toolbox.append(&b);
+        dock.append(&b);
         tools.push((*t, b));
     }
+    overlay.add_overlay(&dock);
 
-    // ---- canvas
-    let area = gtk::DrawingArea::new();
-    area.set_halign(gtk::Align::Center);
-    area.set_valign(gtk::Align::Center);
-    area.set_focusable(true);
-    let scroller = gtk::ScrolledWindow::new();
-    scroller.set_child(Some(&area));
-    scroller.set_hexpand(true);
-    scroller.set_vexpand(true);
-    scroller.add_css_class("linshot-canvas");
+    // ---------------------------------------------------------------- property bar
+    let props = hbox(4);
+    props.add_css_class("ls-pill");
+    props.set_halign(gtk::Align::Center);
+    props.set_valign(gtk::Align::End);
+    props.set_margin_bottom(16);
+    props.set_margin_start(DOCK_W);
 
-    let status = gtk::Label::new(None);
-    status.set_xalign(0.0);
-    status.set_margin_start(8);
-    status.set_margin_bottom(3);
-    status.set_margin_top(3);
-    status.add_css_class("dim-label");
+    let color_g = hbox(2);
+    let dialog = gtk::ColorDialog::builder().with_alpha(true).build();
+    let mut swatches = Vec::new();
+    for i in 0..PALETTE.len() {
+        let b = gtk::Button::new();
+        b.add_css_class("ls-swatch");
+        b.set_widget_name(&format!("ls-swatch-{i}"));
+        b.set_valign(gtk::Align::Center);
+        b.set_halign(gtk::Align::Center);
+        b.set_size_request(22, 22);
+        color_g.append(&b);
+        swatches.push(b);
+    }
+    let color = gtk::ColorDialogButton::new(Some(dialog.clone()));
+    color.set_rgba(&to_rgba(cfg.line_color));
+    color.set_tooltip_text(Some("Custom colour"));
+    color.set_valign(gtk::Align::Center);
+    color_g.append(&color);
 
-    let mid = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    mid.append(&toolbox);
-    mid.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    mid.append(&scroller);
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.append(&props);
-    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    root.append(&mid);
-    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    root.append(&status);
-    win.set_child(Some(&root));
+    let fill_g = hbox(2);
+    let fill_chk = gtk::ToggleButton::new();
+    fill_chk.set_child(Some(&prop_glyph("fill")));
+    fill_chk.set_tooltip_text(Some("Fill shape / text background"));
+    fill_chk.set_active(cfg.fill_enabled);
+    let fill = gtk::ColorDialogButton::new(Some(dialog));
+    fill.set_rgba(&to_rgba(cfg.fill_color));
+    fill.set_tooltip_text(Some("Fill colour"));
+    fill.set_valign(gtk::Align::Center);
+    fill_g.append(&fill_chk);
+    fill_g.append(&fill);
 
-    // initial size / zoom
+    let width_g = hbox(2);
+    let width_cap = cap("Width");
+    let width = gtk::Scale::with_range(gtk::Orientation::Horizontal, 1.0, 30.0, 1.0);
+    width.set_draw_value(false);
+    width.set_value(cfg.line_width);
+    width.set_valign(gtk::Align::Center);
+    let width_val = gtk::Label::new(Some(&format!("{}", cfg.line_width as i32)));
+    width_val.add_css_class("ls-value");
+    width_g.append(&width_cap);
+    width_g.append(&width);
+    width_g.append(&width_val);
+
+    let font_g = hbox(4);
+    let font = gtk::SpinButton::with_range(6.0, 120.0, 1.0);
+    font.set_value(cfg.font_size);
+    font.set_valign(gtk::Align::Center);
+    font.set_tooltip_text(Some("Font size"));
+    font_g.append(&cap("Size"));
+    font_g.append(&font);
+
+    let shadow_g = hbox(0);
+    let shadow = gtk::ToggleButton::new();
+    shadow.set_child(Some(&prop_glyph("shadow")));
+    shadow.set_tooltip_text(Some("Drop shadow"));
+    shadow.set_active(cfg.shadow);
+    shadow_g.append(&shadow);
+
+    let hint = gtk::Label::new(None);
+    hint.add_css_class("ls-hint");
+    let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+    del_btn.set_tooltip_text(Some("Delete selected (Del)"));
+    del_btn.add_css_class("ls-danger");
+
+    let sep1 = gtk::Separator::new(gtk::Orientation::Vertical);
+    let sep2 = gtk::Separator::new(gtk::Orientation::Vertical);
+    props.append(&color_g);
+    props.append(&sep1);
+    props.append(&fill_g);
+    props.append(&width_g);
+    props.append(&font_g);
+    props.append(&sep2);
+    props.append(&shadow_g);
+    props.append(&hint);
+    props.append(&del_btn);
+    overlay.add_overlay(&props);
+
+    // ---------------------------------------------------------------- zoom pill
+    let zoom_pill = hbox(0);
+    zoom_pill.add_css_class("ls-pill");
+    zoom_pill.set_halign(gtk::Align::End);
+    zoom_pill.set_valign(gtk::Align::Start);
+    zoom_pill.set_margin_end(16);
+    zoom_pill.set_margin_top(14);
+    let zoom_out = icon_button("zoom-out-symbolic", "Zoom out (Ctrl+-)");
+    let zoom_in = icon_button("zoom-in-symbolic", "Zoom in (Ctrl++)");
+    let zoom_label = gtk::Label::new(Some("100%"));
+    zoom_label.add_css_class("ls-zoom-label");
+    let zoom_fit = gtk::Button::new();
+    zoom_fit.set_child(Some(&zoom_label));
+    zoom_fit.set_tooltip_text(Some("Fit to window (Ctrl+0) · right-click: 100% (Ctrl+1)"));
+    zoom_pill.append(&zoom_out);
+    zoom_pill.append(&zoom_fit);
+    zoom_pill.append(&zoom_in);
+    overlay.add_overlay(&zoom_pill);
+
+    // ---------------------------------------------------------------- crop bar
+    let crop_bar = hbox(6);
+    crop_bar.add_css_class("ls-pill");
+    crop_bar.set_halign(gtk::Align::Center);
+    crop_bar.set_valign(gtk::Align::Start);
+    crop_bar.set_margin_top(14);
+    crop_bar.append(&cap("Crop to selection"));
+    let crop_cancel = gtk::Button::with_label("Cancel");
+    let crop_apply = gtk::Button::with_label("Apply");
+    crop_apply.add_css_class("ls-primary");
+    crop_bar.append(&crop_cancel);
+    crop_bar.append(&crop_apply);
+    crop_bar.set_visible(false);
+    overlay.add_overlay(&crop_bar);
+
+    // ---------------------------------------------------------------- toast
+    let toast = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .transition_duration(180)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
+        .margin_top(14)
+        .can_target(false)
+        .build();
+    let toast_label = gtk::Label::new(None);
+    toast_label.add_css_class("ls-toast");
+    toast.set_child(Some(&toast_label));
+    overlay.add_overlay(&toast);
+
+    win.set_child(Some(&overlay));
+
+    // ---------------------------------------------------------------- size / zoom
     let (iw, ih) = (img.width() as f64, img.height() as f64);
     let (mw, mh) = crate::overlay::monitors()
         .first()
         .map(|(_, g)| (g.w, g.h))
         .unwrap_or((1366.0, 768.0));
-    let (maxw, maxh) = (mw * 0.85, mh * 0.85);
-    let chrome = (60.0, 130.0);
+    let (maxw, maxh) = (mw * 0.88, mh * 0.88);
+    let chrome = (DOCK_W as f64 + 2.0 * PAD + 8.0, BAR_H as f64 + 2.0 * PAD + 56.0);
     let zoom = (1.0f64).min((maxw - chrome.0) / iw).min((maxh - chrome.1) / ih).max(0.05);
-    let ww = (iw * zoom + chrome.0).clamp(960.0, maxw.max(960.0));
-    let wh = (ih * zoom + chrome.1).clamp(560.0, maxh.max(560.0));
+    let ww = (iw * zoom + chrome.0).clamp(980.0, maxw.max(980.0));
+    let wh = (ih * zoom + chrome.1).clamp(620.0, maxh.max(620.0));
     win.set_default_size(ww as i32, wh as i32);
 
     let style = Style {
@@ -591,7 +918,28 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
     };
     let e = Rc::new(Editor {
         ed: RefCell::new(Ed {
-            doc: Doc { bg: img, shapes: Vec::new() },
+            doc: Doc {
+                bg: img,
+                shapes: pointer
+                    .map(|(sp, x, y)| {
+                        let (w, h) = (sp.width() as f64, sp.height() as f64);
+                        vec![Shape {
+                            kind: Tool::Pointer,
+                            a: (x, y),
+                            b: (x + w, y + h),
+                            pts: Vec::new(),
+                            color: [0.0; 4],
+                            fill: None,
+                            width: 1.0,
+                            font: 12.0,
+                            shadow: false,
+                            text: String::new(),
+                            num: 0,
+                            sprite: Some(sp),
+                        }]
+                    })
+                    .unwrap_or_default(),
+            },
             undo: Vec::new(),
             redo: Vec::new(),
             tool: Tool::Rect,
@@ -611,25 +959,34 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
             win: win.clone(),
             area: area.clone(),
             scroller: scroller.clone(),
-            status,
-            crop_btn: crop_btn.clone(),
+            subtitle,
+            zoom_label,
+            crop_bar,
+            toast,
+            toast_label,
+            toast_gen: Cell::new(0),
             undo_btn: undo_btn.clone(),
             redo_btn: redo_btn.clone(),
             del_btn: del_btn.clone(),
             tools,
             color: color.clone(),
+            swatches: swatches.clone(),
             fill: fill.clone(),
             fill_chk: fill_chk.clone(),
             width: width.clone(),
+            width_cap,
+            width_val,
             font: font.clone(),
             shadow: shadow.clone(),
+            groups: Groups { color: color_g, fill: fill_g, width: width_g, font: font_g, shadow: shadow_g, hint, sep1, sep2 },
         },
         ctx: ctx.clone(),
         syncing: Cell::new(false),
+        last_style_ckpt: Cell::new(None),
     });
     OPEN.with(|o| o.borrow_mut().push(e.clone()));
 
-    // ---- wiring (closures hold weak references to avoid cycles)
+    // ---------------------------------------------------------------- wiring
     macro_rules! on {
         ($btn:expr, $m:ident) => {{
             let w = Rc::downgrade(&e);
@@ -641,28 +998,64 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
         }};
     }
     on!(save_btn, save);
-    on!(save_as_btn, save_as);
     on!(copy_btn, copy);
-    on!(print_btn, print);
     on!(undo_btn, undo);
     on!(redo_btn, redo);
     on!(del_btn, delete_selected);
-    on!(crop_btn, apply_crop);
+    on!(crop_apply, apply_crop);
     on!(zoom_fit, zoom_fit);
+    {
+        let w = Rc::downgrade(&e);
+        crop_cancel.connect_clicked(move |_| {
+            if let Some(e) = w.upgrade() {
+                e.ed.borrow_mut().crop = None;
+                e.refresh();
+            }
+        });
+    }
     {
         let tx = ctx.tx.clone();
         open_btn.connect_clicked(move |_| {
             let _ = tx.send_blocking(crate::Cmd::OpenDialog);
         });
     }
-    for (b, f) in [(&zoom_in, 1.25), (&zoom_out, 0.8), (&zoom_100, 0.0)] {
+    let add_action = |name: &str, f: Box<dyn Fn(&Rc<Editor>)>| {
+        let a = gio::SimpleAction::new(name, None);
+        let w = Rc::downgrade(&e);
+        a.connect_activate(move |_, _| {
+            if let Some(e) = w.upgrade() {
+                f(&e);
+            }
+        });
+        win.add_action(&a);
+    };
+    add_action("save-as", Box::new(|e| e.save_as()));
+    add_action("print", Box::new(|e| e.print()));
+    add_action("capture", Box::new(|e| {
+        let _ = e.ctx.tx.send_blocking(crate::Cmd::cap(crate::Mode::Region));
+    }));
+    add_action("prefs", Box::new(|e| {
+        let _ = e.ctx.tx.send_blocking(crate::Cmd::Settings);
+    }));
+    for (b, f) in [(&zoom_in, 1.25), (&zoom_out, 0.8)] {
         let w = Rc::downgrade(&e);
         b.connect_clicked(move |_| {
             if let Some(e) = w.upgrade() {
-                let z = if f == 0.0 { 1.0 } else { e.ed.borrow().zoom * f };
+                let z = e.ed.borrow().zoom * f;
                 e.set_zoom(z);
             }
         });
+    }
+    {
+        let r = gtk::GestureClick::new();
+        r.set_button(3);
+        let w = Rc::downgrade(&e);
+        r.connect_pressed(move |_, _, _, _| {
+            if let Some(e) = w.upgrade() {
+                e.set_zoom(1.0);
+            }
+        });
+        zoom_fit.add_controller(r);
     }
     for (t, b) in &e.ui.tools {
         let w = Rc::downgrade(&e);
@@ -672,6 +1065,15 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
                 if let Some(e) = w.upgrade() {
                     e.set_tool(t);
                 }
+            }
+        });
+    }
+    for (i, b) in swatches.iter().enumerate() {
+        let w = Rc::downgrade(&e);
+        b.set_tooltip_text(Some(["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Black", "White"][i]));
+        b.connect_clicked(move |_| {
+            if let Some(e) = w.upgrade() {
+                e.ui.color.set_rgba(&to_rgba(PALETTE[i]));
             }
         });
     }
@@ -692,9 +1094,9 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
 
     {
         let w = Rc::downgrade(&e);
-        area.set_draw_func(move |_, cr, _, _| {
+        area.set_draw_func(move |a, cr, _, _| {
             if let Some(e) = w.upgrade() {
-                e.draw(cr);
+                e.draw(a, cr);
             }
         });
     }
@@ -738,8 +1140,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
                 if tool == Tool::Crop && e.ed.borrow().crop.is_some() {
                     e.apply_crop();
                 } else if tool == Tool::Select {
-                    let hit = e.hit(p);
-                    if let Some(i) = hit {
+                    if let Some(i) = e.hit(p) {
                         if e.ed.borrow().doc.shapes[i].kind == Tool::Text {
                             e.text_popover(p, Some(i));
                         }
@@ -791,6 +1192,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>) {
     }
 
     e.ui.tools[1].1.set_active(true);
+    e.update_swatches();
     e.refresh();
     win.present();
 }
@@ -808,7 +1210,7 @@ impl Editor {
 
     fn to_img(&self, x: f64, y: f64) -> Pt {
         let z = self.ed.borrow().zoom;
-        (x / z, y / z)
+        ((x - PAD) / z, (y - PAD) / z)
     }
 
     fn hit(&self, p: Pt) -> Option<usize> {
@@ -819,19 +1221,38 @@ impl Editor {
     fn refresh(&self) {
         let ed = self.ed.borrow();
         let (w, h) = (ed.doc.bg.width(), ed.doc.bg.height());
-        self.ui.area.set_content_width((w as f64 * ed.zoom).round() as i32);
-        self.ui.area.set_content_height((h as f64 * ed.zoom).round() as i32);
+        self.ui.area.set_content_width((w as f64 * ed.zoom + 2.0 * PAD).round() as i32);
+        self.ui.area.set_content_height((h as f64 * ed.zoom + 2.0 * PAD).round() as i32);
         self.ui.undo_btn.set_sensitive(!ed.undo.is_empty());
         self.ui.redo_btn.set_sensitive(!ed.redo.is_empty());
-        self.ui.del_btn.set_sensitive(ed.sel.is_some());
-        self.ui.crop_btn.set_visible(ed.crop.is_some());
-        let saved = match (&ed.path, ed.dirty) {
-            (Some(p), false) => format!(" · saved to {}", p.display()),
-            (_, true) => " · modified".into(),
+        self.ui.del_btn.set_visible(ed.sel.is_some());
+        self.ui.crop_bar.set_visible(ed.crop.is_some());
+        let state = match (&ed.path, ed.dirty) {
+            (Some(p), false) => format!(" · saved as {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            (_, true) => " · edited".into(),
             _ => String::new(),
         };
-        self.ui.status.set_text(&format!("{w} × {h} px · {:.0}%{saved}", ed.zoom * 100.0));
+        self.ui.subtitle.set_text(&format!("{w} × {h}{state}"));
+        self.ui.zoom_label.set_text(&format!("{:.0}%", ed.zoom * 100.0));
         self.ui.area.queue_draw();
+        drop(ed);
+        self.update_props();
+    }
+
+    fn toast(&self, msg: &str) {
+        self.ui.toast_label.set_text(msg);
+        self.ui.toast.set_reveal_child(true);
+        let gen = self.ui.toast_gen.get() + 1;
+        self.ui.toast_gen.set(gen);
+        let toast = self.ui.toast.clone();
+        let w = OPEN.with(|o| o.borrow().iter().find(|e| e.ui.toast == toast).map(Rc::downgrade));
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1800), move || {
+            if let Some(e) = w.and_then(|w| w.upgrade()) {
+                if e.ui.toast_gen.get() == gen {
+                    e.ui.toast.set_reveal_child(false);
+                }
+            }
+        });
     }
 
     fn set_zoom(&self, z: f64) {
@@ -844,11 +1265,56 @@ impl Editor {
             let ed = self.ed.borrow();
             (ed.doc.bg.width() as f64, ed.doc.bg.height() as f64)
         };
-        let aw = self.ui.scroller.width() as f64 - 4.0;
-        let ah = self.ui.scroller.height() as f64 - 4.0;
+        let aw = self.ui.scroller.width() as f64 - 2.0 * PAD - DOCK_W as f64 - 4.0;
+        let ah = self.ui.scroller.height() as f64 - 2.0 * PAD - BAR_H as f64 - 4.0;
         if aw > 10.0 && ah > 10.0 {
             self.set_zoom((aw / w).min(ah / h).min(1.0));
         }
+    }
+
+    /// Shows only the properties that matter for the current tool / selection.
+    fn update_props(&self) {
+        let ed = self.ed.borrow();
+        let kind = match (ed.tool, ed.sel) {
+            (Tool::Select, Some(i)) => ed.doc.shapes.get(i).map(|s| s.kind).unwrap_or(Tool::Select),
+            (t, _) => t,
+        };
+        let g = &self.ui.groups;
+        let (color, fill, width, font, shadow, hint) = match kind {
+            Tool::Rect | Tool::Ellipse => (true, true, true, false, true, ""),
+            Tool::Line | Tool::Arrow | Tool::Pen => (true, false, true, false, true, ""),
+            Tool::Text => (true, true, false, true, true, ""),
+            Tool::Counter => (true, false, false, true, true, ""),
+            Tool::Pixelate | Tool::Blur => (false, false, true, false, false, ""),
+            Tool::Highlight => (false, false, false, false, false, "Drag over text to highlight it"),
+            Tool::Crop => (false, false, false, false, false, "Drag to choose the area, then Enter"),
+            Tool::Select => (false, false, false, false, false, "Click a shape to edit · drag to move · Del to delete"),
+            Tool::Pointer => (false, false, false, false, false, "Mouse pointer · drag to move · Del to remove"),
+        };
+        g.color.set_visible(color);
+        g.fill.set_visible(fill);
+        g.width.set_visible(width);
+        g.font.set_visible(font);
+        g.shadow.set_visible(shadow);
+        g.sep1.set_visible(color && (fill || width || font));
+        g.sep2.set_visible(shadow && (fill || width || font));
+        g.hint.set_visible(!hint.is_empty());
+        g.hint.set_text(hint);
+        self.ui.width_cap.set_text(if matches!(kind, Tool::Pixelate | Tool::Blur) { "Strength" } else { "Width" });
+    }
+
+    fn update_swatches(&self) {
+        let c = from_rgba(&self.ui.color.rgba());
+        for (i, b) in self.ui.swatches.iter().enumerate() {
+            let p = PALETTE[i];
+            let same = (0..3).all(|k| (p[k] - c[k]).abs() < 0.01);
+            if same {
+                b.add_css_class("selected");
+            } else {
+                b.remove_css_class("selected");
+            }
+        }
+        self.ui.width_val.set_text(&format!("{}", self.ui.width.value() as i32));
     }
 
     fn set_tool(&self, t: Tool) {
@@ -872,10 +1338,12 @@ impl Editor {
             Tool::Text => "text",
             _ => "crosshair",
         }));
+        self.update_props();
         self.refresh();
     }
 
     fn style_changed(&self) {
+        self.update_swatches();
         if self.syncing.get() {
             return;
         }
@@ -900,7 +1368,13 @@ impl Editor {
         let mut ed = self.ed.borrow_mut();
         ed.style = style.clone();
         if let Some(i) = ed.sel {
-            ed.checkpoint();
+            // one undo step per burst of changes (e.g. dragging the width slider)
+            let now = std::time::Instant::now();
+            let recent = self.last_style_ckpt.get().map(|t| now.duration_since(t).as_millis() < 800).unwrap_or(false);
+            if !recent {
+                ed.checkpoint();
+            }
+            self.last_style_ckpt.set(Some(now));
             let s = &mut ed.doc.shapes[i];
             if !matches!(s.kind, Tool::Highlight | Tool::Pixelate | Tool::Blur) {
                 s.color = style.color;
@@ -927,10 +1401,15 @@ impl Editor {
         self.ui.font.set_value(s.font);
         self.ui.shadow.set_active(s.shadow);
         self.syncing.set(false);
+        self.update_swatches();
     }
 
     fn press(self: &Rc<Self>, p: Pt, _mods: gdk::ModifierType) {
         let tool = self.ed.borrow().tool;
+        // the captured pointer can be dragged with any drawing tool
+        let on_pointer = tool != Tool::Crop
+            && self.hit(p).map(|i| self.ed.borrow().doc.shapes[i].kind == Tool::Pointer).unwrap_or(false);
+        let tool = if on_pointer { Tool::Select } else { tool };
         match tool {
             Tool::Select => {
                 let hit = self.hit(p);
@@ -944,6 +1423,7 @@ impl Editor {
                 if let Some(s) = s {
                     self.sync_ui(&s);
                 }
+                self.update_props();
             }
             Tool::Text => {
                 let hit = self.hit(p);
@@ -958,8 +1438,10 @@ impl Editor {
                 ed.renumber();
             }
             Tool::Crop => {
-                self.ed.borrow_mut().crop = Some(R { x: p.0, y: p.1, w: 0.0, h: 0.0 });
-                self.ed.borrow_mut().preview = Some(self.ed.borrow().new_shape(Tool::Crop, p));
+                let shape = self.ed.borrow().new_shape(Tool::Crop, p);
+                let mut ed = self.ed.borrow_mut();
+                ed.crop = Some(R { x: p.0, y: p.1, w: 0.0, h: 0.0 });
+                ed.preview = Some(shape);
             }
             k => {
                 let s = self.ed.borrow().new_shape(k, p);
@@ -972,7 +1454,7 @@ impl Editor {
     fn motion(&self, p: Pt, mods: gdk::ModifierType) {
         let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let mut ed = self.ed.borrow_mut();
-        if ed.tool == Tool::Select {
+        if ed.move_orig.is_some() {
             if let (Some(i), Some(orig)) = (ed.sel, ed.move_orig.clone()) {
                 if !ed.move_saved {
                     ed.checkpoint();
@@ -1043,8 +1525,20 @@ impl Editor {
         self.refresh();
     }
 
-    fn draw(&self, cr: &cairo::Context) {
+    fn draw(&self, _area: &gtk::DrawingArea, cr: &cairo::Context) {
         let ed = self.ed.borrow();
+        let (iw, ih) = (ed.doc.bg.width() as f64 * ed.zoom, ed.doc.bg.height() as f64 * ed.zoom);
+        // soft drop shadow under the image
+        for i in 0..14 {
+            let g = i as f64 * 1.6;
+            let a = 0.05 * (1.0 - i as f64 / 14.0);
+            cr.set_source_rgba(0.0, 0.0, 0.0, a);
+            rounded(cr, PAD - g, PAD - g + 6.0, iw + 2.0 * g, ih + 2.0 * g, 4.0 + g);
+            cr.fill().ok();
+        }
+        cr.translate(PAD, PAD);
+        cr.rectangle(0.0, 0.0, iw, ih);
+        cr.clip();
         cr.scale(ed.zoom, ed.zoom);
         if ed.zoom >= 2.0 {
             // crisp pixels when zoomed in
@@ -1073,7 +1567,7 @@ impl Editor {
                 cr.rectangle(r.x - pad, r.y - pad, r.w + 2.0 * pad, r.h + 2.0 * pad);
                 cr.stroke_preserve().ok();
                 cr.set_dash(&[4.0 * lw, 3.0 * lw], 4.0 * lw);
-                cr.set_source_rgb(0.1, 0.4, 0.9);
+                cr.set_source_rgb(0.13, 0.65, 0.40);
                 cr.stroke().ok();
                 cr.set_dash(&[], 0.0);
             }
@@ -1212,7 +1706,7 @@ impl Editor {
         let zoom = self.ed.borrow().zoom;
         let pop = gtk::Popover::new();
         pop.set_parent(&self.ui.area);
-        pop.set_pointing_to(Some(&gdk::Rectangle::new((p.0 * zoom) as i32, (p.1 * zoom) as i32, 1, 1)));
+        pop.set_pointing_to(Some(&gdk::Rectangle::new((p.0 * zoom + PAD) as i32, (p.1 * zoom + PAD) as i32, 1, 1)));
         let bx = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let tv = gtk::TextView::new();
         tv.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -1305,6 +1799,7 @@ impl Editor {
                     ed.path = Some(path.clone());
                 }
                 self.ctx.notify("Screenshot saved", &path.display().to_string(), Some(&path));
+                self.toast(&format!("Saved {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
                 self.refresh();
                 true
             }
@@ -1357,8 +1852,7 @@ impl Editor {
 
     fn copy(&self) {
         imageops::copy_to_clipboard(&self.rendered());
-        self.ctx.notify("Copied to clipboard", "The annotated screenshot is on the clipboard.", None);
-        self.ui.status.set_text("Copied to clipboard");
+        self.toast("Copied to clipboard");
     }
 
     fn print(&self) {

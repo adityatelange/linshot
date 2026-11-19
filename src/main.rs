@@ -9,6 +9,7 @@ mod imageops;
 mod overlay;
 mod settings;
 mod shortcuts;
+mod style;
 mod theme;
 mod wlr;
 mod wm;
@@ -17,7 +18,7 @@ mod tray;
 use cairo::ImageSurface;
 use config::{AfterCapture, Config};
 use gtk::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gio, glib};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -69,6 +70,7 @@ pub struct Ctx {
     busy: Cell<bool>,
     system_dark: Cell<bool>,
     control: RefCell<Option<gtk::ApplicationWindow>>,
+    watchers: RefCell<Vec<gio::FileMonitor>>,
     tray: RefCell<Option<ksni::Handle<tray::Tray>>>,
 }
 
@@ -232,6 +234,7 @@ fn startup(app: &gtk::Application) {
         busy: Cell::new(false),
         system_dark: Cell::new(false),
         control: RefCell::new(None),
+        watchers: RefCell::new(Vec::new()),
         tray: RefCell::new(None),
     });
     CTX.with(|c| {
@@ -239,15 +242,7 @@ fn startup(app: &gtk::Application) {
     });
 
     gtk::Window::set_default_icon_name("linshot");
-    let css = gtk::CssProvider::new();
-    css.load_from_string(
-        ".linshot-overlay { background: black; }
-         .linshot-canvas { background-color: #3c3f41; }
-         .linshot-big { padding: 10px 14px; }",
-    );
-    if let Some(d) = gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&d, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    }
+    style::init();
 
     let open_file = gio::SimpleAction::new("open-file", Some(glib::VariantTy::STRING));
     open_file.connect_activate(|_, v| {
@@ -280,7 +275,12 @@ fn startup(app: &gtk::Application) {
     }
     std::mem::forget(app.hold());
 
-    if !ctx.cfg.borrow().shortcuts_prompted && shortcuts::supported() && !shortcuts::installed() {
+    restore_shortcuts(&ctx);
+    if !ctx.cfg.borrow().shortcuts_prompted
+        && ctx.cfg.borrow().desktop_shortcuts.is_none()
+        && shortcuts::supported()
+        && !shortcuts::installed()
+    {
         let ctx = ctx.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || offer_shortcuts(&ctx));
     }
@@ -293,14 +293,85 @@ fn startup(app: &gtk::Application) {
 }
 
 /// Registers Print-key shortcuts in the desktop's keyboard settings.
-pub fn setup_shortcuts(ctx: &Ctx, parent: Option<&gtk::Window>) {
+/// Re-applies the user's desktop shortcuts if something (a session that
+/// regenerates its config at login, for example) removed them, and keeps
+/// watching for that while Linshot runs.
+fn restore_shortcuts(ctx: &Rc<Ctx>) {
+    if !shortcuts::supported() {
+        return;
+    }
+    let want = ctx.cfg.borrow().desktop_shortcuts;
+    match want {
+        Some(true) => {
+            if !shortcuts::installed() {
+                match shortcuts::install() {
+                    Ok(()) => eprintln!("linshot: keyboard shortcuts were missing, restored them"),
+                    Err(e) => eprintln!("linshot: could not restore keyboard shortcuts: {e}"),
+                }
+            }
+        }
+        None if shortcuts::installed() => {
+            let mut c = ctx.cfg.borrow_mut();
+            c.desktop_shortcuts = Some(true);
+            c.save();
+        }
+        _ => return,
+    }
+    watch_shortcuts(ctx);
+}
+
+fn watch_shortcuts(ctx: &Rc<Ctx>) {
+    if !ctx.watchers.borrow().is_empty() {
+        return;
+    }
+    let Some(path) = shortcuts::watch_path() else { return };
+    let Ok(mon) = gio::File::for_path(&path).monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) else {
+        return;
+    };
+    let pending = Rc::new(Cell::new(false));
+    let ctx2 = ctx.clone();
+    mon.connect_changed(move |_, _, _, _| {
+        if pending.replace(true) {
+            return;
+        }
+        let ctx = ctx2.clone();
+        let pending = pending.clone();
+        // let whoever rewrote the file finish first
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            pending.set(false);
+            if ctx.cfg.borrow().desktop_shortcuts == Some(true) && !shortcuts::installed() {
+                if shortcuts::install().is_ok() {
+                    eprintln!("linshot: desktop config was rewritten, restored keyboard shortcuts");
+                }
+            }
+        });
+    });
+    ctx.watchers.borrow_mut().push(mon);
+}
+
+pub fn remove_shortcuts(ctx: &Ctx) -> Result<(), String> {
+    {
+        let mut c = ctx.cfg.borrow_mut();
+        c.desktop_shortcuts = Some(false);
+        c.save();
+    }
+    shortcuts::uninstall()
+}
+
+pub fn setup_shortcuts(ctx: &Rc<Ctx>, parent: Option<&gtk::Window>) {
     match shortcuts::install() {
         Ok(()) => {
             {
                 let mut c = ctx.cfg.borrow_mut();
                 c.hotkeys = false; // the desktop handles Print now
+                c.desktop_shortcuts = Some(true);
                 c.save();
             }
+            // run at login so lost shortcuts get restored
+            if let Err(e) = config::set_autostart(true) {
+                eprintln!("linshot: could not enable autostart: {e}");
+            }
+            watch_shortcuts(ctx);
             ctx.notify(
                 "Keyboard shortcuts added",
                 "Print: region · Alt+Print: window · Ctrl+Print: full screen · Shift+Print: last region",
@@ -348,6 +419,11 @@ pub fn apply_theme(ctx: &Ctx) {
     };
     if let Some(s) = gtk::Settings::default() {
         s.set_gtk_application_prefer_dark_theme(dark);
+        // themes that are dark by name (e.g. Mint-Y-Dark) when following the system
+        let named_dark = s.gtk_theme_name().map(|n| n.to_lowercase().contains("dark")).unwrap_or(false);
+        style::set_dark(dark || (ctx.cfg.borrow().theme == "system" && named_dark));
+    } else {
+        style::set_dark(dark);
     }
 }
 
@@ -355,7 +431,7 @@ fn handle(ctx: &Rc<Ctx>, cmd: Cmd) {
     match cmd {
         Cmd::Capture(req) => capture(ctx, req),
         Cmd::OpenFile(p) => match imageops::load_file(&p) {
-            Ok(img) => editor::open(ctx, img, p.file_name().map(|n| n.to_string_lossy().into_owned())),
+            Ok(img) => editor::open(ctx, img, p.file_name().map(|n| n.to_string_lossy().into_owned()), None),
             Err(e) => ctx.error(None, &e),
         },
         Cmd::OpenDialog => open_dialog(ctx),
@@ -432,8 +508,10 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             ctx.busy.set(false);
             return;
         };
-        let img = match g.and_then(imageops::surface_from_grab) {
-            Ok(i) => i,
+        let (img, ptr): (ImageSurface, Ptr) = match g.and_then(|(g, c)| imageops::surface_from_grab(g).map(|s| (s, c))) {
+            Ok((i, c)) => (i, c.and_then(|c| {
+                ImageSurface::create_for_data(c.data, cairo::Format::ARgb32, c.w, c.h, c.w * 4).ok().map(|s| (s, c.x, c.y))
+            })),
             Err(e) => {
                 ctx.busy.set(false);
                 if !e.contains("cancelled") {
@@ -449,17 +527,17 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
         // no active-window info: choose the window in our overlay instead
         let mode = if req.mode == Mode::Active && active.is_none() && !interactive { Mode::Window } else { req.mode };
         match mode {
-            Mode::Full => deliver(&ctx, img, &req),
-            _ if interactive => deliver(&ctx, img, &req),
+            Mode::Full => deliver(&ctx, img, &req, ptr_at(&ptr, 0, 0)),
+            _ if interactive => deliver(&ctx, img, &req, ptr_at(&ptr, 0, 0)),
             Mode::Active => {
                 let (x, y, w, h) = active.unwrap();
                 let (x2, y2) = ((x + w).min(img.width()), (y + h).min(img.height()));
                 let (x, y) = (x.max(0), y.max(0));
-                deliver(&ctx, imageops::crop(&img, x, y, (x2 - x).max(1), (y2 - y).max(1)), &req)
+                deliver(&ctx, imageops::crop(&img, x, y, (x2 - x).max(1), (y2 - y).max(1)), &req, ptr_at(&ptr, x, y))
             }
             Mode::Last if ctx.cfg.borrow().last_region.map(fits).unwrap_or(false) => {
                 let r = ctx.cfg.borrow().last_region.unwrap();
-                deliver(&ctx, imageops::crop(&img, r[0], r[1], r[2], r[3]), &req)
+                deliver(&ctx, imageops::crop(&img, r[0], r[1], r[2], r[3]), &req, ptr_at(&ptr, r[0], r[1]))
             }
             _ => {
                 let ctx2 = ctx.clone();
@@ -478,7 +556,7 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
                                 c.last_region = Some([x, y, w, h]);
                                 c.save();
                             }
-                            deliver(&ctx2, imageops::crop(&full, x, y, w, h), &req)
+                            deliver(&ctx2, imageops::crop(&full, x, y, w, h), &req, ptr_at(&ptr, x, y))
                         }
                         None => ctx2.busy.set(false),
                     }),
@@ -517,8 +595,32 @@ impl Area {
     }
 }
 
-fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req) {
+/// Captured pointer sprite and its position in the full screenshot.
+type Ptr = Option<(ImageSurface, i32, i32)>;
+
+/// The pointer relative to a crop starting at (x, y).
+fn ptr_at(p: &Ptr, x: i32, y: i32) -> Option<(ImageSurface, f64, f64)> {
+    p.as_ref().map(|(s, px, py)| (s.clone(), (px - x) as f64, (py - y) as f64))
+}
+
+fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req, ptr: Option<(ImageSurface, f64, f64)>) {
     ctx.busy.set(false);
+    // keep the pointer only if it is inside the captured area
+    let ptr = ptr.filter(|(s, x, y)| {
+        *x + (s.width() as f64) > 0.0 && *y + (s.height() as f64) > 0.0 && *x < img.width() as f64 && *y < img.height() as f64
+    });
+    let action = req.action.unwrap_or(ctx.cfg.borrow().after_capture);
+    if action == AfterCapture::Editor && req.output.is_none() {
+        editor::open(ctx, img, None, ptr);
+        return;
+    }
+    // not going to the editor: paint the pointer in
+    if let Some((s, x, y)) = &ptr {
+        if let Ok(cr) = cairo::Context::new(&img) {
+            cr.set_source_surface(s, *x, *y).ok();
+            cr.paint().ok();
+        }
+    }
     let q = ctx.cfg.borrow().jpeg_quality;
     let save = |path: PathBuf| match imageops::save(&img, &path, q) {
         Ok(()) => {
@@ -541,9 +643,8 @@ fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req) {
         }
         return;
     }
-    let action = req.action.unwrap_or(ctx.cfg.borrow().after_capture);
     match action {
-        AfterCapture::Editor => editor::open(ctx, img, None),
+        AfterCapture::Editor => {}
         AfterCapture::Save => {
             save(ctx.cfg.borrow().next_output_path());
         }

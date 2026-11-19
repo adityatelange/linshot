@@ -123,7 +123,7 @@ pub fn show(ctx: &Rc<Ctx>) {
         let win = win.clone();
         let refresh = refresh_sc.clone();
         sc_remove.connect_clicked(move |_| {
-            if let Err(e) = shortcuts::uninstall() {
+            if let Err(e) = crate::remove_shortcuts(&ctx) {
                 ctx.error(Some(&win), &e);
             }
             refresh();

@@ -176,6 +176,14 @@ pub fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
+/// File to watch for external rewrites of our shortcuts (Wayfire only).
+pub fn watch_path() -> Option<std::path::PathBuf> {
+    (desktop() == Desktop::Wayfire).then(|| {
+        let p = wayfire::config_path();
+        std::fs::canonicalize(&p).unwrap_or(p)
+    })
+}
+
 pub fn installed() -> bool {
     match desktop() {
         Desktop::Wayfire => wayfire::installed(),
@@ -300,6 +308,7 @@ pub mod wayfire {
         ("linshot_full", "full", "<ctrl> KEY_SYSRQ"),
         ("linshot_last", "last", "<shift> KEY_SYSRQ"),
     ];
+    const AUTOSTART_KEY: &str = "linshot_autostart";
 
     pub fn config_path() -> PathBuf {
         if let Some(p) = std::env::var_os("WAYFIRE_CONFIG_FILE") {
@@ -334,7 +343,7 @@ pub mod wayfire {
     fn strip(lines: Vec<String>) -> Vec<String> {
         lines
             .into_iter()
-            .filter(|l| !key_of(l).map(|k| KEYS.iter().any(|x| k.ends_with(x.0))).unwrap_or(false))
+            .filter(|l| !key_of(l).map(|k| k == AUTOSTART_KEY || KEYS.iter().any(|x| k.ends_with(x.0))).unwrap_or(false))
             .map(|l| l.strip_prefix(MARK).map(str::to_string).unwrap_or(l))
             .collect()
     }
@@ -376,7 +385,7 @@ pub mod wayfire {
                 continue;
             }
             if section == "core" && key_of(l) == Some("plugins") {
-                for p in ["ipc", "ipc-rules"] {
+                for p in ["ipc", "ipc-rules", "autostart"] {
                     if !l.split(['=', ' ', '\t']).any(|w| w == p) {
                         l.push(' ');
                         l.push_str(p);
@@ -391,7 +400,14 @@ pub mod wayfire {
             block.push(format!("binding_{name} = {key}"));
             block.push(format!("command_{name} = {exe} {sub}"));
         }
-        match lines.iter().position(|l| is_section(l).as_deref() == Some("command")) {
+        insert(&mut lines, "command", block);
+        // start Linshot with Wayfire so it can restore these if the config is regenerated
+        insert(&mut lines, "autostart", vec![format!("{AUTOSTART_KEY} = {exe} --tray")]);
+        write(&path, &lines)
+    }
+
+    fn insert(lines: &mut Vec<String>, section: &str, block: Vec<String>) {
+        match lines.iter().position(|l| is_section(l).as_deref() == Some(section)) {
             Some(i) => {
                 for (j, b) in block.into_iter().enumerate() {
                     lines.insert(i + 1 + j, b);
@@ -401,11 +417,10 @@ pub mod wayfire {
                 if lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
                     lines.push(String::new());
                 }
-                lines.push("[command]".into());
+                lines.push(format!("[{section}]"));
                 lines.extend(block);
             }
         }
-        write(&path, &lines)
     }
 
     pub fn uninstall() -> Result<(), String> {
@@ -448,14 +463,16 @@ mod tests {
         assert!(s.contains("# linshot-disabled: binding_screenshot = KEY_SYSRQ"));
         assert!(s.contains("binding_linshot_window = <alt> KEY_SYSRQ"));
         assert!(s.contains("binding_terminal = <super> KEY_ENTER"));
-        assert!(s.contains("plugins = command ipc ipc-rules"));
+        assert!(s.contains("plugins = command ipc ipc-rules autostart"));
+        assert!(s.contains("[autostart]\nlinshot_autostart = "));
         // idempotent
         super::wayfire::install().unwrap();
         assert_eq!(std::fs::read_to_string(&ini).unwrap().matches("command_linshot_region").count(), 1);
 
         super::wayfire::uninstall().unwrap();
         // plugins stay enabled; everything else is restored
-        assert_eq!(std::fs::read_to_string(&ini).unwrap(), original.replace("plugins = command", "plugins = command ipc ipc-rules"));
+        let after = std::fs::read_to_string(&ini).unwrap();
+        assert_eq!(after, format!("{}\n[autostart]\n", original.replace("plugins = command", "plugins = command ipc ipc-rules autostart")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
