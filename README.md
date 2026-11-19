@@ -5,7 +5,7 @@
 <h1 align="center">Linshot</h1>
 
 A screenshot and annotation tool for Linux, written in Rust + GTK 4.
-Works on **X11** and **Wayland** (GNOME, KDE Plasma, wlroots compositors such as Sway/Hyprland).
+Works on **X11** and **Wayland** (GNOME, KDE Plasma, Cinnamon, and wlroots compositors such as Wayfire, Sway, Hyprland, labwc).
 
 ![Editor](docs/editor.png)
 
@@ -21,6 +21,7 @@ Works on **X11** and **Wayland** (GNOME, KDE Plasma, wlroots compositors such as
 - **Editor:** rectangle, ellipse, line, arrow, freehand, text, highlighter, pixelate, blur,
   numbered step counters, crop; select/move/delete, per-shape colour/fill/width/font/shadow,
   undo/redo, zoom
+- **Mouse pointer** included in captures (optional)
 - **Output:** save (PNG/JPEG, filename pattern), save as, copy to clipboard, print, open existing images
 - **Tray icon** (StatusNotifierItem), single instance, notifications, autostart option
 
@@ -41,8 +42,10 @@ Requires GTK ≥ 4.12: Ubuntu 24.04+, Debian 13+, or newer derivatives.
 | Full screen   | Ctrl+Print     | `linshot full`             |
 | Last region   | Shift+Print    | `linshot last`             |
 
-Wayland does not allow apps to grab global keys, so add these as custom shortcuts in your desktop's
-keyboard settings. If your desktop already owns the Print key on X11, either free it or bind the
+Wayland does not allow apps to grab global keys. On **Wayfire** (via `wayfire.ini`), **Cinnamon** and **GNOME**, Linshot offers to
+register these shortcuts in the desktop's keyboard settings on first start (also in Preferences →
+Shortcuts) and frees Print from the built-in screenshot tool. On other desktops add them as custom
+shortcuts yourself. If your desktop already owns the Print key on X11, either free it or bind the
 commands the same way.
 
 Editor keys: `S` select, `R` rect, `E` ellipse, `L` line, `A` arrow, `F` freehand, `T` text,
@@ -61,8 +64,10 @@ linshot [region|window|active|full|last|open FILE...|settings|quit] [-d SECONDS]
 ## How capture works
 
 - **X11:** grabs the root window directly; window list from `_NET_CLIENT_LIST_STACKING`.
-- **Wayland:** `org.freedesktop.portal.Screenshot` (needs `xdg-desktop-portal` plus your desktop's backend);
-  falls back to `grim`, `spectacle` or `gnome-screenshot`. Window capture uses the portal's interactive picker.
+- **Wayland, wlroots compositors (Wayfire, Sway, Hyprland, labwc, river):** native `wlr-screencopy`, no helper tools.
+- **Window detection on Wayland:** Wayfire IPC (`ipc` + `ipc-rules` plugins), `swaymsg`, `hyprctl`.
+- **Wayland, other desktops:** Cinnamon's screenshot API, then `org.freedesktop.portal.Screenshot`, then `grim`,
+  `spectacle` or `gnome-screenshot`. Window capture uses the portal's picker, or Linshot's own overlay when there is none.
 
 ## Build
 

@@ -39,17 +39,17 @@ fn tmp_png() -> PathBuf {
 
 /// Grab the entire desktop. `interactive` asks the portal to let the user pick
 /// (used for window capture on Wayland).
-pub fn grab(interactive: bool) -> Result<Grab, String> {
+pub fn grab(interactive: bool, cursor: bool) -> Result<Grab, String> {
     if is_wayland() {
-        grab_wayland(interactive)
+        grab_wayland(interactive, cursor)
     } else {
-        grab_x11()
+        grab_x11(cursor)
     }
 }
 
 // ---------------------------------------------------------------- X11
 
-pub fn grab_x11() -> Result<Grab, String> {
+pub fn grab_x11(cursor: bool) -> Result<Grab, String> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
@@ -88,20 +88,68 @@ pub fn grab_x11() -> Result<Grab, String> {
             dst[x * 4..x * 4 + 4].copy_from_slice(&px.to_ne_bytes());
         }
     }
+    if cursor {
+        let _ = draw_x11_cursor(&conn, &mut data, w, h);
+    }
     Ok(Grab::Pixels { width: w, height: h, stride, data })
+}
+
+/// Composites the current pointer image (XFixes) onto BGRA pixels.
+fn draw_x11_cursor(conn: &impl x11rb::connection::Connection, data: &mut [u8], w: i32, h: i32) -> Result<(), Box<dyn std::error::Error>> {
+    use x11rb::protocol::xfixes::ConnectionExt;
+    conn.xfixes_query_version(5, 0)?.reply()?;
+    let c = conn.xfixes_get_cursor_image()?.reply()?;
+    let (ox, oy) = (c.x as i32 - c.xhot as i32, c.y as i32 - c.yhot as i32);
+    for cy in 0..c.height as i32 {
+        for cx in 0..c.width as i32 {
+            let (x, y) = (ox + cx, oy + cy);
+            if x < 0 || y < 0 || x >= w || y >= h {
+                continue;
+            }
+            let src = c.cursor_image[(cy * c.width as i32 + cx) as usize]; // premultiplied ARGB
+            let a = src >> 24;
+            if a == 0 {
+                continue;
+            }
+            let off = ((y * w + x) * 4) as usize;
+            let dst = u32::from_ne_bytes(data[off..off + 4].try_into()?);
+            let mix = |sh: u32| -> u32 {
+                let s = (src >> sh) & 0xff;
+                let d = (dst >> sh) & 0xff;
+                (s + d * (255 - a) / 255).min(255)
+            };
+            let px = 0xff00_0000 | mix(16) << 16 | mix(8) << 8 | mix(0);
+            data[off..off + 4].copy_from_slice(&px.to_ne_bytes());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- Wayland
 
-fn grab_wayland(interactive: bool) -> Result<Grab, String> {
+fn grab_wayland(interactive: bool, cursor: bool) -> Result<Grab, String> {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
     let wlroots = ["sway", "hyprland", "river", "wlroots", "wayfire", "labwc", "niri", "dwl"]
         .iter()
         .any(|d| desktop.contains(d));
     let mut errors = Vec::new();
 
+    // wlroots compositors (Wayfire, Sway, Hyprland, labwc, ...): native, no helper needed
+    if !interactive {
+        match crate::wlr::grab(cursor) {
+            Ok(g) => return Ok(g),
+            Err(e) => errors.push(format!("wlr-screencopy: {e}")),
+        }
+    }
+    if desktop.contains("cinnamon") && !interactive {
+        match cinnamon_screenshot(cursor) {
+            Ok(g) => return Ok(g),
+            Err(e) => errors.push(format!("cinnamon: {e}")),
+        }
+    }
+    let grim: &[&str] = if cursor { &["grim", "-c"] } else { &["grim"] };
     if wlroots && !interactive && has_cmd("grim") {
-        match run_tool(&["grim"], true) {
+        match run_tool(grim, true) {
             Ok(g) => return Ok(g),
             Err(e) => errors.push(e),
         }
@@ -111,19 +159,21 @@ fn grab_wayland(interactive: bool) -> Result<Grab, String> {
         Err(e) => errors.push(format!("portal: {e}")),
     }
     if has_cmd("grim") {
-        match run_tool(&["grim"], true) {
+        match run_tool(grim, true) {
             Ok(g) => return Ok(g),
             Err(e) => errors.push(e),
         }
     }
     if has_cmd("spectacle") {
-        match run_tool(&["spectacle", "-b", "-n", "-f", "-o"], true) {
+        let cmd: &[&str] = if cursor { &["spectacle", "-b", "-n", "-f", "-p", "-o"] } else { &["spectacle", "-b", "-n", "-f", "-o"] };
+        match run_tool(cmd, true) {
             Ok(g) => return Ok(g),
             Err(e) => errors.push(e),
         }
     }
     if has_cmd("gnome-screenshot") {
-        match run_tool(&["gnome-screenshot", "-f"], true) {
+        let cmd: &[&str] = if cursor { &["gnome-screenshot", "-p", "-f"] } else { &["gnome-screenshot", "-f"] };
+        match run_tool(cmd, true) {
             Ok(g) => return Ok(g),
             Err(e) => errors.push(e),
         }
@@ -150,6 +200,30 @@ fn run_tool(cmd: &[&str], path_last: bool) -> Result<Grab, String> {
         let _ = std::fs::remove_file(&out);
         Err(format!("{} failed", cmd[0]))
     }
+}
+
+/// Cinnamon's own screenshot D-Bus API (org.Cinnamon.Screenshot).
+fn cinnamon_screenshot(cursor: bool) -> Result<Grab, String> {
+    let conn = zbus::blocking::Connection::session().map_err(|e| e.to_string())?;
+    let out = tmp_png();
+    let path = out.to_string_lossy().into_owned();
+    conn.call_method(
+        Some("org.Cinnamon"),
+        "/org/Cinnamon",
+        Some("org.Cinnamon"),
+        "Screenshot",
+        &(cursor, false, path.as_str()),
+    )
+    .map_err(|e| e.to_string())?;
+    // the file is written asynchronously by the shell
+    for _ in 0..50 {
+        if std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            return Ok(Grab::File(out));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("no file written".into())
 }
 
 /// org.freedesktop.portal.Screenshot. Returns the path of the saved PNG.

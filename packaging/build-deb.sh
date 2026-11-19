@@ -18,6 +18,7 @@ rm -rf "$PKG"
 install -Dm755 target/release/linshot "$PKG/usr/bin/linshot"
 install -Dm644 data/io.github.linshot.Linshot.desktop "$PKG/usr/share/applications/io.github.linshot.Linshot.desktop"
 install -Dm644 data/linshot.svg "$PKG/usr/share/icons/hicolor/scalable/apps/linshot.svg"
+for i in data/icons/*.svg; do install -Dm644 "$i" "$PKG/usr/share/icons/hicolor/scalable/apps/$(basename "$i")"; done
 install -Dm644 README.md "$PKG/usr/share/doc/$NAME/README.md"
 install -Dm644 LICENSE "$PKG/usr/share/doc/$NAME/copyright"
 printf '%s (%s) unstable; urgency=medium\n\n  * Release %s.\n\n -- %s  %s\n' \

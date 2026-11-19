@@ -12,12 +12,16 @@ cairo-rs = { version = "0.20", features = ["png"] }
 pangocairo = "0.20"
 async-channel = "2"
 ksni = "0.2"
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["xfixes"] }
 zbus = "4"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
 
 [profile.release]
 opt-level = 3

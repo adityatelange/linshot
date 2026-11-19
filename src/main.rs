@@ -8,6 +8,10 @@ mod hotkeys;
 mod imageops;
 mod overlay;
 mod settings;
+mod shortcuts;
+mod theme;
+mod wlr;
+mod wm;
 mod tray;
 
 use cairo::ImageSurface;
@@ -63,7 +67,9 @@ pub struct Ctx {
     pub cfg: RefCell<Config>,
     pub tx: async_channel::Sender<Cmd>,
     busy: Cell<bool>,
+    system_dark: Cell<bool>,
     control: RefCell<Option<gtk::ApplicationWindow>>,
+    tray: RefCell<Option<ksni::Handle<tray::Tray>>>,
 }
 
 impl Ctx {
@@ -224,7 +230,9 @@ fn startup(app: &gtk::Application) {
         cfg: RefCell::new(Config::load()),
         tx: tx.clone(),
         busy: Cell::new(false),
+        system_dark: Cell::new(false),
         control: RefCell::new(None),
+        tray: RefCell::new(None),
     });
     CTX.with(|c| {
         let _ = c.set(ctx.clone());
@@ -249,17 +257,98 @@ fn startup(app: &gtk::Application) {
     });
     app.add_action(&open_file);
 
-    tray::spawn(tx.clone());
-    if capture::is_x11() && ctx.cfg.borrow().hotkeys {
+    *ctx.tray.borrow_mut() = Some(tray::spawn(tx.clone()));
+    apply_theme(&ctx);
+    let (ttx, trx) = async_channel::unbounded::<bool>();
+    theme::spawn_watcher(ttx);
+    {
+        let ctx = ctx.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(dark) = trx.recv().await {
+                ctx.system_dark.set(dark);
+                apply_theme(&ctx);
+                let panel_dark = dark || tray::panel_always_dark();
+                if let Some(h) = ctx.tray.borrow().as_ref() {
+                    h.update(|t| t.dark_panel = panel_dark);
+                }
+            }
+        });
+    }
+
+    if capture::is_x11() && ctx.cfg.borrow().hotkeys && !shortcuts::installed() {
         hotkeys::spawn(tx.clone());
     }
     std::mem::forget(app.hold());
+
+    if !ctx.cfg.borrow().shortcuts_prompted && shortcuts::supported() && !shortcuts::installed() {
+        let ctx = ctx.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || offer_shortcuts(&ctx));
+    }
 
     glib::spawn_future_local(async move {
         while let Ok(cmd) = rx.recv().await {
             handle(&ctx, cmd);
         }
     });
+}
+
+/// Registers Print-key shortcuts in the desktop's keyboard settings.
+pub fn setup_shortcuts(ctx: &Ctx, parent: Option<&gtk::Window>) {
+    match shortcuts::install() {
+        Ok(()) => {
+            {
+                let mut c = ctx.cfg.borrow_mut();
+                c.hotkeys = false; // the desktop handles Print now
+                c.save();
+            }
+            ctx.notify(
+                "Keyboard shortcuts added",
+                "Print: region · Alt+Print: window · Ctrl+Print: full screen · Shift+Print: last region",
+                None,
+            );
+        }
+        Err(e) => ctx.error(parent, &format!("Could not add keyboard shortcuts: {e}")),
+    }
+}
+
+fn offer_shortcuts(ctx: &Rc<Ctx>) {
+    {
+        let mut c = ctx.cfg.borrow_mut();
+        c.shortcuts_prompted = true;
+        c.save();
+    }
+    let dlg = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Use the Print key for Linshot?")
+        .detail(format!(
+            "Linshot will add these shortcuts to {}'s keyboard settings and take Print away from the built-in screenshot tool:\n\n\
+             Print — capture region\nAlt+Print — capture window\nCtrl+Print — capture full screen\nShift+Print — capture last region\n\n\
+             You can undo this in Linshot's Preferences.",
+            shortcuts::desktop_name()
+        ))
+        .buttons(["Set up shortcuts", "Not now"])
+        .default_button(0)
+        .cancel_button(1)
+        .build();
+    let ctx2 = ctx.clone();
+    let parent = ctx.app.active_window();
+    dlg.choose(parent.as_ref(), gio::Cancellable::NONE, move |r| {
+        if r == Ok(0) {
+            setup_shortcuts(&ctx2, None);
+        }
+    });
+}
+
+/// Applies the configured appearance: follow the desktop, or force light/dark.
+pub fn apply_theme(ctx: &Ctx) {
+    let dark = match ctx.cfg.borrow().theme.as_str() {
+        "dark" => true,
+        "light" => false,
+        _ => ctx.system_dark.get(),
+    };
+    if let Some(s) = gtk::Settings::default() {
+        s.set_gtk_application_prefer_dark_theme(dark);
+    }
 }
 
 fn handle(ctx: &Rc<Ctx>, cmd: Cmd) {
@@ -311,17 +400,35 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
 
         let wayland = capture::is_wayland();
         let x11 = capture::is_x11();
-        let interactive = wayland && matches!(req.mode, Mode::Window | Mode::Active);
+        let want_picker = wayland && matches!(req.mode, Mode::Window | Mode::Active);
+        let cursor = ctx.cfg.borrow().capture_cursor;
         let want_windows = x11 && matches!(req.mode, Mode::Region | Mode::Window | Mode::Last);
         let want_active = x11 && req.mode == Mode::Active;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let active = if want_active { capture::x11_active_window() } else { None };
-            let g = capture::grab(interactive);
-            let wins = if want_windows { capture::x11_windows() } else { Vec::new() };
-            let _ = tx.send_blocking((g, wins, active));
+            // Wayland compositors with an IPC window list (Wayfire, Sway, Hyprland)
+            let wl = if wayland { wm::windows() } else { None };
+            let interactive = want_picker && wl.is_none();
+            let mut active = if want_active { capture::x11_active_window().map(|r| Area::Px(r)) } else { None };
+            // no interactive portal (e.g. wlroots): grab everything and let the user select
+            let (g, interactive) = match capture::grab(interactive, cursor) {
+                Err(e) if interactive && !e.contains("cancelled") => (capture::grab(false, cursor), false),
+                r => (r, interactive),
+            };
+            let mut wins: Vec<Area> = if want_windows {
+                capture::x11_windows().into_iter().map(Area::Px).collect()
+            } else {
+                Vec::new()
+            };
+            if let Some(w) = wl {
+                wins = w.list.into_iter().map(Area::Logical).collect();
+                if active.is_none() {
+                    active = w.active.map(Area::Logical);
+                }
+            }
+            let _ = tx.send_blocking((g, wins, active, interactive));
         });
-        let Ok((g, wins, active)) = rx.recv().await else {
+        let Ok((g, wins, active, interactive)) = rx.recv().await else {
             ctx.busy.set(false);
             return;
         };
@@ -336,17 +443,20 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             }
         };
         let fits = |r: [i32; 4]| r[2] > 0 && r[3] > 0 && r[0] + r[2] <= img.width() && r[1] + r[3] <= img.height();
-        match req.mode {
+        let to_px = |a: &Area| a.to_px(img.width(), img.height());
+        let wins: Vec<(i32, i32, i32, i32)> = wins.iter().map(to_px).collect();
+        let active = active.as_ref().map(to_px);
+        // no active-window info: choose the window in our overlay instead
+        let mode = if req.mode == Mode::Active && active.is_none() && !interactive { Mode::Window } else { req.mode };
+        match mode {
             Mode::Full => deliver(&ctx, img, &req),
             _ if interactive => deliver(&ctx, img, &req),
-            Mode::Active => match active {
-                Some((x, y, w, h)) => {
-                    let (x2, y2) = ((x + w).min(img.width()), (y + h).min(img.height()));
-                    let (x, y) = (x.max(0), y.max(0));
-                    deliver(&ctx, imageops::crop(&img, x, y, x2 - x, y2 - y), &req)
-                }
-                None => deliver(&ctx, img, &req),
-            },
+            Mode::Active => {
+                let (x, y, w, h) = active.unwrap();
+                let (x2, y2) = ((x + w).min(img.width()), (y + h).min(img.height()));
+                let (x, y) = (x.max(0), y.max(0));
+                deliver(&ctx, imageops::crop(&img, x, y, (x2 - x).max(1), (y2 - y).max(1)), &req)
+            }
             Mode::Last if ctx.cfg.borrow().last_region.map(fits).unwrap_or(false) => {
                 let r = ctx.cfg.borrow().last_region.unwrap();
                 deliver(&ctx, imageops::crop(&img, r[0], r[1], r[2], r[3]), &req)
@@ -359,7 +469,7 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
                     &ctx.app,
                     img,
                     wins,
-                    req.mode == Mode::Window,
+                    mode == Mode::Window,
                     mag,
                     Box::new(move |r| match r {
                         Some((x, y, w, h)) => {
@@ -376,6 +486,35 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             }
         }
     });
+}
+
+/// A window rectangle either in image pixels (X11) or global logical
+/// coordinates (Wayland compositor IPC).
+enum Area {
+    Px((i32, i32, i32, i32)),
+    Logical(wm::Rect),
+}
+
+impl Area {
+    fn to_px(&self, img_w: i32, img_h: i32) -> (i32, i32, i32, i32) {
+        match *self {
+            Area::Px(r) => r,
+            Area::Logical((x, y, w, h)) => {
+                let virt = overlay::monitors().iter().fold(overlay::R::default(), |a, (_, g)| a.union(g));
+                if virt.w <= 0.0 {
+                    return (x as i32, y as i32, w as i32, h as i32);
+                }
+                let sx = img_w as f64 / virt.w;
+                let sy = img_h as f64 / virt.h;
+                (
+                    ((x - virt.x) * sx).round() as i32,
+                    ((y - virt.y) * sy).round() as i32,
+                    (w * sx).round() as i32,
+                    (h * sy).round() as i32,
+                )
+            }
+        }
+    }
 }
 
 fn deliver(ctx: &Rc<Ctx>, img: ImageSurface, req: &Req) {

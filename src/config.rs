@@ -31,6 +31,11 @@ pub struct Config {
     pub line_width: f64,
     pub font_size: f64,
     pub shadow: bool,
+    /// "system", "light" or "dark"
+    pub theme: String,
+    /// asked once whether to register desktop shortcuts
+    pub shortcuts_prompted: bool,
+    pub capture_cursor: bool,
 }
 
 impl Default for Config {
@@ -54,6 +59,9 @@ impl Default for Config {
             line_width: 3.0,
             font_size: 18.0,
             shadow: true,
+            theme: "system".into(),
+            shortcuts_prompted: false,
+            capture_cursor: true,
         }
     }
 }

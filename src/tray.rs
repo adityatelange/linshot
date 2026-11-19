@@ -7,8 +7,10 @@ use crate::{Cmd, Mode};
 use ksni::menu::{StandardItem, SubMenu};
 use ksni::MenuItem;
 
-struct Tray {
+pub struct Tray {
     tx: async_channel::Sender<Cmd>,
+    /// panel is dark → use the white glyph
+    pub dark_panel: bool,
 }
 
 impl Tray {
@@ -32,7 +34,7 @@ impl ksni::Tray for Tray {
         "Linshot".into()
     }
     fn icon_name(&self) -> String {
-        "linshot".into()
+        if self.dark_panel { "linshot-tray-light" } else { "linshot-tray-dark" }.into()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
@@ -71,7 +73,14 @@ impl ksni::Tray for Tray {
     }
 }
 
-pub fn spawn(tx: async_channel::Sender<Cmd>) {
-    let service = ksni::TrayService::new(Tray { tx });
+/// GNOME's top bar is dark regardless of the theme.
+pub fn panel_always_dark() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").map(|d| d.to_lowercase().contains("gnome")).unwrap_or(false)
+}
+
+pub fn spawn(tx: async_channel::Sender<Cmd>) -> ksni::Handle<Tray> {
+    let service = ksni::TrayService::new(Tray { tx, dark_panel: true });
+    let handle = service.handle();
     service.spawn();
+    handle
 }

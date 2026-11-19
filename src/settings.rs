@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Aditya Telange
 
 use crate::config::{self, AfterCapture};
-use crate::{capture, Ctx};
+use crate::{capture, shortcuts, Ctx};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use std::rc::Rc;
@@ -62,9 +62,17 @@ pub fn show(ctx: &Rc<Ctx>) {
     after.set_selected(ACTIONS.iter().position(|a| a.0 == cfg.after_capture).unwrap_or(0) as u32);
     add("After capture", after.upcast_ref());
 
+    const THEMES: [(&str, &str); 3] = [("system", "Follow system"), ("light", "Light"), ("dark", "Dark")];
+    let theme = gtk::DropDown::from_strings(&THEMES.map(|t| t.1));
+    theme.set_selected(THEMES.iter().position(|t| t.0 == cfg.theme).unwrap_or(0) as u32);
+    add("Appearance", theme.upcast_ref());
+
     let notif = gtk::CheckButton::with_label("Show notifications");
     notif.set_active(cfg.notifications);
     add("", notif.upcast_ref());
+    let cur = gtk::CheckButton::with_label("Capture mouse pointer");
+    cur.set_active(cfg.capture_cursor);
+    add("", cur.upcast_ref());
     let mag = gtk::CheckButton::with_label("Show magnifier while selecting");
     mag.set_active(cfg.magnifier);
     add("", mag.upcast_ref());
@@ -75,6 +83,53 @@ pub fn show(ctx: &Rc<Ctx>) {
     let auto = gtk::CheckButton::with_label("Start Linshot when I log in");
     auto.set_active(config::autostart_path().exists());
     add("", auto.upcast_ref());
+
+    let sc_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let sc_add = gtk::Button::with_label("Set up Print key shortcuts");
+    let sc_remove = gtk::Button::with_label("Remove");
+    let sc_state = gtk::Label::new(None);
+    sc_state.add_css_class("dim-label");
+    sc_box.append(&sc_add);
+    sc_box.append(&sc_remove);
+    sc_box.append(&sc_state);
+    let refresh_sc = {
+        let (sc_add, sc_remove, sc_state) = (sc_add.clone(), sc_remove.clone(), sc_state.clone());
+        move || {
+            let ok = shortcuts::supported();
+            let on = ok && shortcuts::installed();
+            sc_add.set_sensitive(ok);
+            sc_remove.set_sensitive(on);
+            sc_state.set_text(if !ok {
+                "not available on this desktop — bind the commands below manually"
+            } else if on {
+                "✔ active"
+            } else {
+                ""
+            });
+        }
+    };
+    refresh_sc();
+    {
+        let ctx = ctx.clone();
+        let win = win.clone();
+        let refresh = refresh_sc.clone();
+        sc_add.connect_clicked(move |_| {
+            crate::setup_shortcuts(&ctx, Some(&win));
+            refresh();
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        let win = win.clone();
+        let refresh = refresh_sc.clone();
+        sc_remove.connect_clicked(move |_| {
+            if let Err(e) = shortcuts::uninstall() {
+                ctx.error(Some(&win), &e);
+            }
+            refresh();
+        });
+    }
+    add("Shortcuts", sc_box.upcast_ref());
 
     let session = if capture::is_wayland() { "Wayland" } else if capture::is_x11() { "X11" } else { "unknown" };
     let info = gtk::Label::new(Some(&format!(
@@ -128,9 +183,12 @@ pub fn show(ctx: &Rc<Ctx>) {
                 c.after_capture = ACTIONS[(after.selected() as usize).min(3)].0;
                 c.notifications = notif.is_active();
                 c.magnifier = mag.is_active();
+                c.capture_cursor = cur.is_active();
                 c.hotkeys = hot.is_active();
+                c.theme = THEMES[(theme.selected() as usize).min(2)].0.into();
                 c.save();
             }
+            crate::apply_theme(&ctx);
             if let Err(e) = config::set_autostart(auto.is_active()) {
                 ctx.error(Some(&win2), &format!("Could not update autostart: {e}"));
             }
