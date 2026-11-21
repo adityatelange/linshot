@@ -25,6 +25,7 @@ memmap2 = "0.9"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# thin LTO with parallel codegen: about half the build time of fat LTO
+# with a single codegen unit, for a slightly larger binary
+lto = "thin"
 strip = true

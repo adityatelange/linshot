@@ -15,9 +15,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RUSTFLAGS: -D warnings
+      # no debug info: faster to build and much smaller to cache
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --locked
+      # reuses compiled dependencies between runs
+      - uses: Swatinem/rust-cache@v2
+      # builds the whole program (in test mode) and runs the tests
       - run: cargo test --locked
