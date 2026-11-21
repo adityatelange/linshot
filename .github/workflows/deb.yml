@@ -5,6 +5,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# needed by the release job to create the GitHub release
+permissions:
+  contents: write
+
 jobs:
   deb:
     # Built on the oldest supported release: the package's glibc/GTK
@@ -23,7 +27,7 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
@@ -32,7 +36,30 @@ jobs:
         run: |
           sudo apt-get install -y ./dist/*.deb
           linshot --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linshot-${{ matrix.distro }}-${{ matrix.arch }}
           path: dist/*.deb
+
+  # On a version tag (v*), publish a GitHub release with the packages from
+  # every build above plus SHA256 checksums. Manual runs only build.
+  release:
+    needs: deb
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.deb > SHA256SUMS && cat SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Linshot ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --verify-tag
