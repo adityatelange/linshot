@@ -106,7 +106,13 @@ pub enum Kind {
 }
 
 fn classify(env: Env) -> Kind {
-    let wayland_session = env("XDG_SESSION_TYPE").map(|t| t.eq_ignore_ascii_case("wayland")).unwrap_or(false);
+    let ty = env("XDG_SESSION_TYPE").map(|t| t.to_ascii_lowercase());
+    // an X11 session that inherited a WAYLAND_DISPLAY (WSLg, a nested or
+    // remote X session started from Wayland) is still X11
+    if ty.as_deref() == Some("x11") && env("DISPLAY").is_some() {
+        return Kind::X11;
+    }
+    let wayland_session = ty.as_deref() == Some("wayland");
     // a Wayland session counts as Wayland even when GTK runs through XWayland
     // (GDK_BACKEND=x11): the X root there only shows X clients
     if env("WAYLAND_DISPLAY").is_some() || wayland_session {
@@ -192,6 +198,7 @@ mod tests {
     fn session_kind() {
         assert_eq!(classify(&env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")])), Kind::Wayland);
         assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")])), Kind::X11);
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "x11"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")])), Kind::X11);
         // started from a systemd unit or ssh: no session type
         assert_eq!(classify(&env(&[("DISPLAY", ":1")])), Kind::X11);
         assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "tty"), ("DISPLAY", ":0")])), Kind::X11);

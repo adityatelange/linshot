@@ -93,7 +93,8 @@ impl State {
         if let Some(s) = self.selection() {
             return Some(s);
         }
-        if self.start.is_none() && !self.windows.is_empty() && self.has_cursor {
+        // no real drag (hovering, or a plain click): the window under the pointer
+        if !self.windows.is_empty() && self.has_cursor {
             return self.hover_window();
         }
         None
@@ -226,19 +227,31 @@ pub fn select(
             let st = st.clone();
             area.set_draw_func(move |_, cr, w, h| draw(&st.borrow(), cr, g, w as f64, h as f64));
         }
+        // pointer controllers sit on the window, not the drawing area: when the
+        // overlay maps under a pointer that has not moved, some window managers
+        // (xfwm4) deliver the first press before the pointer has "entered" the
+        // area, and only the window sees it
         let motion = gtk::EventControllerMotion::new();
-        {
+        let track = {
             let st = st.clone();
             let redraw = redraw.clone();
-            motion.connect_motion(move |_, x, y| {
+            move |x: f64, y: f64| {
                 let mut s = st.borrow_mut();
                 s.cursor = (g.x + x, g.y + y);
                 s.has_cursor = true;
                 drop(s);
                 redraw();
-            });
+            }
+        };
+        {
+            // the overlay opens under a pointer that has not moved yet: take
+            // its position from the enter event, or window picking and the
+            // hover highlight stay off until the first motion
+            let track = track.clone();
+            motion.connect_enter(move |_, x, y| track(x, y));
         }
-        area.add_controller(motion);
+        motion.connect_motion(move |_, x, y| track(x, y));
+        win.add_controller(motion);
 
         let drag = gtk::GestureDrag::new();
         drag.set_button(1);
@@ -250,6 +263,7 @@ pub fn select(
                 s.start = Some(p);
                 s.cur = p;
                 s.cursor = p;
+                s.has_cursor = true;
             });
         }
         {
@@ -282,7 +296,7 @@ pub fn select(
                 }
             });
         }
-        area.add_controller(drag);
+        win.add_controller(drag);
 
         let rclick = gtk::GestureClick::new();
         rclick.set_button(3);
@@ -290,7 +304,7 @@ pub fn select(
             let finish = finish.clone();
             rclick.connect_pressed(move |_, _, _, _| finish(None));
         }
-        area.add_controller(rclick);
+        win.add_controller(rclick);
 
         let keys = gtk::EventControllerKey::new();
         {

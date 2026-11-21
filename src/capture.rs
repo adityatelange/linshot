@@ -435,6 +435,14 @@ fn x11_windows_impl() -> Result<Vec<(i32, i32, i32, i32)>, Box<dyn std::error::E
     let hidden = atom("_NET_WM_STATE_HIDDEN")?;
     let frame = atom("_NET_FRAME_EXTENTS")?;
     let gtk_frame = atom("_GTK_FRAME_EXTENTS")?;
+    let wm_desktop = atom("_NET_WM_DESKTOP")?;
+    let icccm_state = atom("WM_STATE")?;
+    let card = |w: u32, a: Atom, ty: AtomEnum| -> Option<u32> {
+        conn.get_property(false, w, a, ty, 0, 1).ok()?.reply().ok()?.value32()?.next()
+    };
+    let current = card(root, atom("_NET_CURRENT_DESKTOP")?, AtomEnum::CARDINAL);
+    let screen = &conn.setup().roots[sn];
+    let (sw, sh) = (screen.width_in_pixels as i32, screen.height_in_pixels as i32);
 
     let ids: Vec<u32> = conn
         .get_property(false, root, stacking, AtomEnum::WINDOW, 0, 4096)?
@@ -457,8 +465,28 @@ fn x11_windows_impl() -> Result<Vec<(i32, i32, i32, i32)>, Box<dyn std::error::E
         if states.contains(&hidden) {
             continue;
         }
+        // mutter / muffin (GNOME, Cinnamon) keep windows of other workspaces
+        // mapped: skip windows that are not on the current one (0xFFFFFFFF =
+        // on all workspaces), and iconic ones (ICCCM WM_STATE 3)
+        if let (Some(cur), Some(d)) = (current, card(w, wm_desktop, AtomEnum::CARDINAL)) {
+            if d != cur && d != 0xFFFF_FFFF {
+                continue;
+            }
+        }
+        if conn
+            .get_property(false, w, icccm_state, icccm_state, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32()?.next())
+            == Some(3)
+        {
+            continue;
+        }
         if let Some(r) = window_rect(&conn, root, w, frame, gtk_frame) {
-            out.push(r);
+            // off-screen (e.g. on another viewport)
+            if r.0 < sw && r.1 < sh && r.0 + r.2 > 0 && r.1 + r.3 > 0 {
+                out.push(r);
+            }
         }
     }
     Ok(out)
@@ -485,18 +513,24 @@ fn window_rect(
             .collect();
         (v.len() == 4).then(|| v.into_iter().map(|x| x as i32).collect())
     };
-    if let Some(e) = ext(frame) {
-        // left, right, top, bottom: server-side decorations
-        x -= e[0];
-        y -= e[2];
-        wd += e[0] + e[1];
-        ht += e[2] + e[3];
-    } else if let Some(e) = ext(gtk_frame) {
+    // left, right, top, bottom. A window drawing its own decorations has no
+    // frame, but xfwm4 still sets _NET_FRAME_EXTENTS (to zeros) on it, so the
+    // client-side shadow margins are checked first.
+    let nonzero = |e: &Option<Vec<i32>>| e.as_ref().is_some_and(|e| e.iter().any(|&v| v != 0));
+    let (gtk_ext, net_ext) = (ext(gtk_frame), ext(frame));
+    if nonzero(&gtk_ext) {
         // client-side shadows: shrink
+        let e = gtk_ext.unwrap();
         x += e[0];
         y += e[2];
         wd -= e[0] + e[1];
         ht -= e[2] + e[3];
+    } else if let Some(e) = net_ext {
+        // server-side decorations: grow
+        x -= e[0];
+        y -= e[2];
+        wd += e[0] + e[1];
+        ht += e[2] + e[3];
     }
     (wd > 1 && ht > 1).then_some((x, y, wd, ht))
 }
