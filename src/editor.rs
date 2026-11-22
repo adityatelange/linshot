@@ -198,6 +198,9 @@ fn draw_arrow(cr: &cairo::Context, s: &Shape) {
 
 fn draw_shape(cr: &cairo::Context, s: &Shape, bg: &ImageSurface) {
     cr.save().ok();
+    // save/restore don't reset the path: a text shape leaves a current point,
+    // and the next arc would draw a line from it
+    cr.new_path();
     cr.set_line_width(s.width);
     cr.set_line_cap(cairo::LineCap::Round);
     cr.set_line_join(cairo::LineJoin::Round);
@@ -2243,5 +2246,37 @@ mod tests {
             obfuscated(&bg, [i % 32, 0, 16, 16, 2, 2]).unwrap();
         }
         assert!(bg.user_data(&OBF_KEY).unwrap().0.borrow().len() <= OBF_CACHE_MAX);
+    }
+
+    #[test]
+    fn counters_are_not_joined_by_lines() {
+        let bg = ImageSurface::create(cairo::Format::ARgb32, 200, 60).unwrap();
+        let out = ImageSurface::create(cairo::Format::ARgb32, 200, 60).unwrap();
+        let counter = |x: f64, num: u32| Shape {
+            kind: Tool::Counter,
+            a: (x, 30.0),
+            b: (x, 30.0),
+            pts: Vec::new(),
+            color: [0.9, 0.2, 0.2, 1.0],
+            fill: None,
+            width: 3.0,
+            font: 18.0,
+            shadow: false,
+            text: String::new(),
+            num,
+            sprite: None,
+        };
+        {
+            let cr = cairo::Context::new(&out).unwrap();
+            draw_shape(&cr, &counter(30.0, 1), &bg);
+            draw_shape(&cr, &counter(170.0, 2), &bg);
+        }
+        // halfway between the two discs: nothing may be painted
+        let data = out.take_data().unwrap();
+        let stride = 200 * 4;
+        for y in 0..60 {
+            let i = y * stride + 100 * 4;
+            assert_eq!(data[i + 3], 0, "stray line at (100, {y})");
+        }
     }
 }
