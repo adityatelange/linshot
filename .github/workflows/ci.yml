@@ -3,7 +3,16 @@ name: CI
 on:
   push:
     branches: ["**"]
+    # text and website only: nothing to build or test
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+      - "docs/**"
   pull_request:
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+      - "docs/**"
 
 jobs:
   test:
