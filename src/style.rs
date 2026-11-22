@@ -138,6 +138,21 @@ window.ls-editor headerbar button { border-radius: 9px; }
 .ls-primary:active { background: shade(@ls_accent, 0.92); }
 .ls-soft { background: @ls_hover; border-radius: 9px; padding: 4px 12px; border: none; box-shadow: none; font-weight: 600; }
 
+/* delayed-capture countdown bubble */
+window.ls-countdown-win { background: none; }
+.ls-countdown {
+  background: @ls_surface; color: @ls_text;
+  border: 1px solid @ls_border; border-radius: 18px;
+  padding: 12px 14px 12px 18px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.25), 0 1px 3px rgba(0,0,0,0.18);
+}
+.ls-countdown-num {
+  font-size: 30pt; font-weight: 800; color: @ls_accent;
+  font-feature-settings: "tnum";
+}
+.ls-countdown-title { font-weight: 700; }
+.ls-countdown-hint { color: @ls_muted; font-size: 0.85em; }
+
 .ls-zoom-label { font-feature-settings: "tnum"; min-width: 54px; font-weight: 600; }
 .ls-hint { color: @ls_muted; padding: 0 10px; }
 .ls-toast {

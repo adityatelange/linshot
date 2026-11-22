@@ -4,6 +4,7 @@
 mod capture;
 mod compat;
 mod config;
+mod countdown;
 mod editor;
 mod hotkeys;
 mod imageops;
@@ -71,6 +72,8 @@ pub enum Cmd {
     Settings,
     Show,
     Quit,
+    /// stop the countdown of a delayed capture
+    CancelCapture,
 }
 
 impl Cmd {
@@ -98,6 +101,8 @@ pub struct Ctx {
     control: RefCell<Option<gtk::ApplicationWindow>>,
     watchers: RefCell<Vec<gio::FileMonitor>>,
     tray: RefCell<Option<tray::TrayHandle>>,
+    /// set to cancel the delayed capture that is counting down
+    countdown: RefCell<Option<Rc<Cell<bool>>>>,
 }
 
 impl Ctx {
@@ -305,6 +310,7 @@ fn startup(app: &gtk::Application) {
         control: RefCell::new(None),
         watchers: RefCell::new(Vec::new()),
         tray: RefCell::new(None),
+        countdown: RefCell::new(None),
     });
     CTX.with(|c| {
         let _ = c.set(ctx.clone());
@@ -525,6 +531,11 @@ fn handle(ctx: &Rc<Ctx>, cmd: Cmd) {
         Cmd::Settings => settings::show(ctx),
         Cmd::Show => show_control(ctx),
         Cmd::Quit => ctx.app.quit(),
+        Cmd::CancelCapture => {
+            if let Some(c) = ctx.countdown.borrow().as_ref() {
+                c.set(true);
+            }
+        }
     }
 }
 
@@ -569,12 +580,27 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
     }
     let ctx = ctx.clone();
     glib::spawn_future_local(async move {
-        // nothing on screen to get out of the way (a shortcut, the command
-        // line): grab right away instead of after a fixed pause
-        let wait = if req.delay > 0 { req.delay as u64 * 1000 } else { settle as u64 };
-        if wait > 0 {
-            glib::timeout_future(std::time::Duration::from_millis(wait)).await;
+        if settle > 0 {
+            glib::timeout_future(std::time::Duration::from_millis(settle as u64)).await;
         }
+        if req.delay > 0 {
+            // visible countdown (bubble + tray icon), cancellable
+            let cancel = Rc::new(Cell::new(false));
+            *ctx.countdown.borrow_mut() = Some(cancel.clone());
+            let ok = countdown::run(&ctx.app, req.delay, cancel, |n| {
+                if let Some(t) = ctx.tray.borrow().as_ref() {
+                    t.set_countdown(n);
+                }
+            })
+            .await;
+            *ctx.countdown.borrow_mut() = None;
+            if !ok {
+                drop(busy);
+                return;
+            }
+        }
+        // with no delay and nothing on screen to get out of the way (a
+        // shortcut, the command line) this grabs right away
 
         let wayland = capture::is_wayland();
         let x11 = capture::is_x11();
