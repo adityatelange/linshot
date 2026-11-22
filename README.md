@@ -79,7 +79,7 @@ installed (desktops only accept clipboard data from a focused window).
 
 ```bash
 sudo apt install libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
-curl https://sh.rustup.rs -sSf | sh   # Rust ≥ 1.86; distro cargo is too old on 22.04/Debian 12
+curl https://sh.rustup.rs -sSf | sh   # Rust ≥ 1.88; distro cargo is too old on 22.04/Debian 12
 packaging/build-deb.sh          # -> dist/linshot_<version>_<arch>.deb
 ```
 
