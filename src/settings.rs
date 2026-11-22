@@ -193,7 +193,6 @@ pub fn show(ctx: &Rc<Ctx>) {
     }
     let (hot, hot_row) = g.switch("Grab the Print key directly", Some("X11 only, when the desktop has no shortcut settings; applies after a restart"), cfg.hotkeys);
     hot_row.set_sensitive(capture::is_x11());
-    page.append(&g.root);
 
     let session = if capture::is_wayland() { "Wayland" } else if capture::is_x11() { "X11" } else { "unknown" };
     let mut text = format!(
@@ -209,9 +208,11 @@ pub fn show(ctx: &Rc<Ctx>) {
     info.set_wrap(true);
     info.set_xalign(0.0);
     info.add_css_class("ls-prefs-note");
-    info.set_margin_top(-12);
     info.set_margin_start(4);
-    page.append(&info);
+    // inside the group, so it sits close under the card (a negative margin
+    // here makes GTK warn about the label's size)
+    g.root.append(&info);
+    page.append(&g.root);
 
     // ------------------------------------------------------------ general
     let g = Group::new("General");

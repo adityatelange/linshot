@@ -149,6 +149,12 @@ fn rgba(cr: &cairo::Context, c: [f64; 4]) {
     cr.set_source_rgba(c[0], c[1], c[2], c[3]);
 }
 
+/// Shapes that use a fill (text: its background box). The others would close
+/// an open path and fill it.
+fn fillable(kind: Tool) -> bool {
+    matches!(kind, Tool::Rect | Tool::Ellipse | Tool::Text)
+}
+
 fn shape_path(cr: &cairo::Context, s: &Shape) {
     match s.kind {
         Tool::Rect => {
@@ -181,11 +187,19 @@ fn shape_path(cr: &cairo::Context, s: &Shape) {
     }
 }
 
-fn draw_arrow(cr: &cairo::Context, s: &Shape) {
+fn draw_arrow(cr: &cairo::Context, s: &Shape, color: [f64; 4]) {
+    let d = (s.b.0 - s.a.0).hypot(s.b.1 - s.a.1);
+    if d < 0.5 {
+        return;
+    }
     let ang = (s.b.1 - s.a.1).atan2(s.b.0 - s.a.0);
-    let len = 10.0 + s.width * 3.0;
+    // the head never outgrows the arrow, or the shaft would poke out behind the tail
+    let len = (10.0 + s.width * 3.0).min(d);
     let spread = 0.45;
     let base = (s.b.0 - len * 0.8 * ang.cos(), s.b.1 - len * 0.8 * ang.sin());
+    // shaft and head overlap: draw them opaque in a group and apply the alpha once
+    cr.push_group();
+    cr.set_source_rgb(color[0], color[1], color[2]);
     cr.move_to(s.a.0, s.a.1);
     cr.line_to(base.0, base.1);
     cr.stroke().ok();
@@ -194,6 +208,8 @@ fn draw_arrow(cr: &cairo::Context, s: &Shape) {
     cr.line_to(s.b.0 - len * (ang + spread).cos(), s.b.1 - len * (ang + spread).sin());
     cr.close_path();
     cr.fill().ok();
+    cr.pop_group_to_source().ok();
+    cr.paint_with_alpha(color[3]).ok();
 }
 
 fn draw_shape(cr: &cairo::Context, s: &Shape, bg: &ImageSurface) {
@@ -211,11 +227,23 @@ fn draw_shape(cr: &cairo::Context, s: &Shape, bg: &ImageSurface) {
                 cr.save().ok();
                 cr.translate(off, off);
                 if s.kind == Tool::Arrow {
-                    rgba(cr, if shadow { [0.0, 0.0, 0.0, 0.3] } else { s.color });
-                    draw_arrow(cr, s);
+                    draw_arrow(cr, s, if shadow { [0.0, 0.0, 0.0, 0.3] } else { s.color });
                 } else {
                     shape_path(cr, s);
-                    if let (Some(f), false) = (s.fill, shadow) {
+                    let fill = s.fill.filter(|_| fillable(s.kind));
+                    if let Some(f) = fill {
+                        if shadow {
+                            // a filled shape casts a solid shadow; an outline-only one
+                            // would show through a translucent fill as a dark ring
+                            cr.push_group();
+                            cr.set_source_rgb(0.0, 0.0, 0.0);
+                            cr.fill_preserve().ok();
+                            cr.stroke().ok();
+                            cr.pop_group_to_source().ok();
+                            cr.paint_with_alpha(0.3).ok();
+                            cr.restore().ok();
+                            continue;
+                        }
                         rgba(cr, f);
                         cr.fill_preserve().ok();
                     }
@@ -436,7 +464,7 @@ impl Ed {
         let (color, fill) = match kind {
             Tool::Highlight => ([1.0, 0.92, 0.23, 1.0], None),
             Tool::Pixelate | Tool::Blur => ([0.0; 4], None),
-            _ => (st.color, st.fill_on.then_some(st.fill)),
+            k => (st.color, (st.fill_on && fillable(k)).then_some(st.fill)),
         };
         Shape {
             kind,
@@ -1610,7 +1638,7 @@ impl Editor {
             if let Some(s) = ed.doc.shapes.get_mut(i) {
                 if !matches!(s.kind, Tool::Highlight | Tool::Pixelate | Tool::Blur) {
                     s.color = style.color;
-                    s.fill = style.fill_on.then_some(style.fill);
+                    s.fill = (style.fill_on && fillable(s.kind)).then_some(style.fill);
                 }
                 s.width = style.width;
                 s.font = style.font;
@@ -1749,7 +1777,9 @@ impl Editor {
                 }
                 _ => {
                     let r = s.rect();
-                    if r.w >= 2.0 || r.h >= 2.0 {
+                    // an ellipse needs both dimensions to be visible
+                    let big = if s.kind == Tool::Ellipse { r.w >= 2.0 && r.h >= 2.0 } else { r.w >= 2.0 || r.h >= 2.0 };
+                    if big {
                         ed.checkpoint();
                         ed.doc.shapes.push(s);
                     }
@@ -2246,6 +2276,86 @@ mod tests {
             obfuscated(&bg, [i % 32, 0, 16, 16, 2, 2]).unwrap();
         }
         assert!(bg.user_data(&OBF_KEY).unwrap().0.borrow().len() <= OBF_CACHE_MAX);
+    }
+
+    fn shape(kind: Tool, a: Pt, b: Pt) -> Shape {
+        Shape {
+            kind,
+            a,
+            b,
+            pts: vec![a, b],
+            color: [0.9, 0.2, 0.2, 1.0],
+            fill: None,
+            width: 3.0,
+            font: 18.0,
+            shadow: false,
+            text: String::new(),
+            num: 1,
+            sprite: None,
+        }
+    }
+
+    /// Draws the shapes on a transparent 200x200 surface; returns (data, stride).
+    fn render(shapes: &[Shape]) -> (Vec<u8>, usize) {
+        let bg = ImageSurface::create(cairo::Format::ARgb32, 200, 200).unwrap();
+        let mut out = ImageSurface::create(cairo::Format::ARgb32, 200, 200).unwrap();
+        {
+            let cr = cairo::Context::new(&out).unwrap();
+            for s in shapes {
+                draw_shape(&cr, s, &bg);
+            }
+        }
+        let stride = out.stride() as usize;
+        out.flush();
+        (out.data().unwrap().to_vec(), stride)
+    }
+
+    fn alpha(d: &(Vec<u8>, usize), x: usize, y: usize) -> u8 {
+        d.0[y * d.1 + x * 4 + 3]
+    }
+
+    #[test]
+    fn open_shapes_are_never_filled() {
+        assert!(!fillable(Tool::Pen) && !fillable(Tool::Line) && !fillable(Tool::Arrow));
+        // a U-shaped stroke with a fill set (e.g. an older shape): the inside stays empty
+        let mut pen = shape(Tool::Pen, (50.0, 50.0), (150.0, 50.0));
+        pen.pts = vec![(50.0, 50.0), (50.0, 150.0), (150.0, 150.0), (150.0, 50.0)];
+        pen.fill = Some([1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(alpha(&render(&[pen]), 100, 100), 0);
+    }
+
+    #[test]
+    fn short_arrow_stays_between_its_ends() {
+        let d = render(&[shape(Tool::Arrow, (100.0, 100.0), (108.0, 100.0))]);
+        // nothing behind the tail (round cap: width/2 = 1.5 px is allowed)
+        for x in 0..97 {
+            assert_eq!(alpha(&d, x, 100), 0, "paint at x={x}");
+        }
+        // zero length (the press before any motion) draws nothing
+        let d = render(&[shape(Tool::Arrow, (100.0, 100.0), (100.0, 100.0))]);
+        assert!((0..200).all(|x| alpha(&d, x, 100) == 0));
+    }
+
+    #[test]
+    fn translucent_arrow_has_even_alpha() {
+        let mut a = shape(Tool::Arrow, (20.0, 100.0), (180.0, 100.0));
+        a.width = 10.0;
+        a.color[3] = 0.5;
+        let d = render(&[a]);
+        // along the axis: shaft, shaft/head overlap and head all the same
+        let along: Vec<u8> = (30..175).map(|x| alpha(&d, x, 100)).collect();
+        assert!(along.iter().all(|&v| (126..=129).contains(&v)), "{along:?}");
+    }
+
+    #[test]
+    fn translucent_fill_shadow_is_solid() {
+        let mut r = shape(Tool::Rect, (40.0, 40.0), (160.0, 160.0));
+        r.fill = Some([1.0, 1.0, 1.0, 0.5]);
+        r.shadow = true;
+        let d = render(&[r]);
+        // inside, the shadow is the same everywhere: no darker ring by the edge
+        let (a, b) = (alpha(&d, 100, 100), alpha(&d, 43, 100));
+        assert_eq!(a, b);
     }
 
     #[test]
