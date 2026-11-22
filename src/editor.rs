@@ -1154,7 +1154,8 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     add_action("save-as", Box::new(|e| e.save_as()));
     add_action("print", Box::new(|e| e.print()));
     add_action("capture", Box::new(|e| {
-        let _ = e.ctx.tx.send_blocking(crate::Cmd::cap(crate::Mode::Region));
+        // started from the header-bar menu: let the popover close first
+        let _ = e.ctx.tx.send_blocking(crate::Cmd::cap(crate::Mode::Region).from_menu());
     }));
     add_action("prefs", Box::new(|e| {
         let _ = e.ctx.tx.send_blocking(crate::Cmd::Settings);

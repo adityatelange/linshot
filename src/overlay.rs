@@ -454,6 +454,26 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
     }
 }
 
+/// Does the one-time work of the first selector ahead of time: GTK creates
+/// its renderer (GL setup) when the first window is realized, and cairo loads
+/// the label font on first use. Done once in the background after startup,
+/// this takes several hundred ms off the first Print press.
+pub fn warm_up(app: &gtk::Application) {
+    let t = std::time::Instant::now();
+    if let Ok(img) = ImageSurface::create(cairo::Format::ARgb32, 64, 32) {
+        if let Ok(cr) = cairo::Context::new(&img) {
+            label(&cr, "0 × 0", 0.0, 0.0, 64.0);
+        }
+    }
+    // realized (renderer and surface created) but never shown
+    let win = gtk::Window::builder().application(app).decorated(false).title("Linshot").build();
+    win.add_css_class("linshot-overlay");
+    win.set_child(Some(&gtk::DrawingArea::new()));
+    WidgetExt::realize(&win);
+    win.destroy();
+    crate::trace("warm up", t);
+}
+
 fn label_width(cr: &cairo::Context, text: &str) -> f64 {
     cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
     cr.set_font_size(13.0);

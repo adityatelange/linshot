@@ -46,12 +46,20 @@ pub enum Mode {
     Last,
 }
 
+/// Time for a panel menu or popover to disappear (fade-outs included).
+const MENU_SETTLE_MS: u32 = 250;
+/// Time for the launcher window to be hidden by the window manager.
+const WINDOW_SETTLE_MS: u32 = 300;
+
 #[derive(Clone, Debug)]
 pub struct Req {
     pub mode: Mode,
     pub delay: u32,
     pub output: Option<PathBuf>,
     pub action: Option<AfterCapture>,
+    /// ms to wait before grabbing so a menu or popover that started the
+    /// capture has closed; 0 for shortcuts and the command line
+    pub settle: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -67,10 +75,17 @@ pub enum Cmd {
 
 impl Cmd {
     pub fn cap(mode: Mode) -> Cmd {
-        Cmd::Capture(Req { mode, delay: 0, output: None, action: None })
+        Cmd::Capture(Req { mode, delay: 0, output: None, action: None, settle: 0 })
     }
     pub fn delayed(mode: Mode, delay: u32) -> Cmd {
-        Cmd::Capture(Req { mode, delay, output: None, action: None })
+        Cmd::Capture(Req { mode, delay, output: None, action: None, settle: 0 })
+    }
+    /// A capture started from a menu (tray, editor): wait for it to close.
+    pub fn from_menu(self) -> Cmd {
+        match self {
+            Cmd::Capture(r) => Cmd::Capture(Req { settle: MENU_SETTLE_MS, ..r }),
+            c => c,
+        }
     }
 }
 
@@ -182,7 +197,7 @@ fn parse(args: &[String], cwd: &Path) -> Result<Vec<Cmd>, String> {
     }
     let mut cmds: Vec<Cmd> = files.into_iter().map(Cmd::OpenFile).collect();
     if let Some(m) = mode {
-        cmds.push(Cmd::Capture(Req { mode: m, delay, output, action }));
+        cmds.push(Cmd::Capture(Req { mode: m, delay, output, action, settle: 0 }));
     }
     if let Some(o) = other {
         cmds.push(o);
@@ -337,6 +352,11 @@ fn startup(app: &gtk::Application) {
     std::mem::forget(app.hold());
 
     restore_shortcuts(&ctx);
+    {
+        // once startup is over, so it does not delay anything shown now
+        let app = ctx.app.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || overlay::warm_up(&app));
+    }
     if !ctx.cfg.borrow().shortcuts_prompted
         && ctx.cfg.borrow().desktop_shortcuts.is_none()
         && shortcuts::supported()
@@ -540,13 +560,21 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
         eprintln!("linshot: a capture is already in progress, ignoring {:?}", req.mode);
         return;
     };
+    let mut settle = req.settle;
     if let Some(w) = ctx.control.borrow().as_ref() {
-        w.set_visible(false);
+        if w.is_visible() {
+            w.set_visible(false);
+            settle = settle.max(WINDOW_SETTLE_MS);
+        }
     }
     let ctx = ctx.clone();
     glib::spawn_future_local(async move {
-        let wait = if req.delay > 0 { req.delay as u64 * 1000 } else { 300 };
-        glib::timeout_future(std::time::Duration::from_millis(wait)).await;
+        // nothing on screen to get out of the way (a shortcut, the command
+        // line): grab right away instead of after a fixed pause
+        let wait = if req.delay > 0 { req.delay as u64 * 1000 } else { settle as u64 };
+        if wait > 0 {
+            glib::timeout_future(std::time::Duration::from_millis(wait)).await;
+        }
 
         let wayland = capture::is_wayland();
         let x11 = capture::is_x11();

@@ -18,7 +18,7 @@ impl Tray {
         StandardItem {
             label: label.into(),
             activate: Box::new(move |t: &mut Self| {
-                let _ = t.tx.send_blocking(cmd.clone());
+                let _ = t.tx.send_blocking(cmd.clone().from_menu());
             }),
             ..Default::default()
         }
