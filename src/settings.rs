@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Aditya Telange
 
+//! Preferences window: grouped cards of rows (title, optional subtitle, a
+//! control on the right), switches for on/off settings, in the style of
+//! GNOME's preference pages but with plain GTK 4.6 widgets.
 use crate::config::{self, AfterCapture};
-use crate::{capture, shortcuts, Ctx};
+use crate::{Ctx, capture, shortcuts};
 use gtk::prelude::*;
-use gtk::glib;
 use std::rc::Rc;
 
 const ACTIONS: [(AfterCapture, &str); 4] = [
@@ -13,121 +15,175 @@ const ACTIONS: [(AfterCapture, &str); 4] = [
     (AfterCapture::Clipboard, "Copy to clipboard"),
     (AfterCapture::SaveAndClipboard, "Save and copy"),
 ];
+const THEMES: [(&str, &str); 3] = [("system", "Follow system"), ("light", "Light"), ("dark", "Dark")];
+
+/// A titled card of rows.
+struct Group {
+    root: gtk::Box,
+    list: gtk::ListBox,
+}
+
+impl Group {
+    fn new(title: &str) -> Group {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let t = gtk::Label::new(Some(title));
+        t.add_css_class("ls-group-title");
+        t.set_xalign(0.0);
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("ls-group");
+        root.append(&t);
+        root.append(&list);
+        Group { root, list }
+    }
+
+    /// Adds a row; returns it so the caller can hide or desensitize it.
+    fn row(&self, title: &str, subtitle: Option<&str>, control: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        b.add_css_class("ls-row");
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        text.set_valign(gtk::Align::Center);
+        let t = gtk::Label::new(Some(title));
+        t.set_xalign(0.0);
+        t.add_css_class("ls-row-title");
+        text.append(&t);
+        if let Some(s) = subtitle {
+            let l = gtk::Label::new(Some(s));
+            l.set_xalign(0.0);
+            l.set_wrap(true);
+            l.set_max_width_chars(40);
+            l.add_css_class("ls-row-sub");
+            text.append(&l);
+        }
+        control.set_valign(gtk::Align::Center);
+        b.append(&text);
+        b.append(control);
+        let row = gtk::ListBoxRow::new();
+        row.set_activatable(false);
+        row.set_child(Some(&b));
+        self.list.append(&row);
+        row
+    }
+
+    fn switch(&self, title: &str, subtitle: Option<&str>, on: bool) -> (gtk::Switch, gtk::ListBoxRow) {
+        let s = gtk::Switch::new();
+        s.set_active(on);
+        let row = self.row(title, subtitle, &s);
+        (s, row)
+    }
+}
+
+fn dropdown(items: &[&str], selected: usize) -> gtk::DropDown {
+    let d = gtk::DropDown::from_strings(items);
+    d.set_selected(selected as u32);
+    d
+}
 
 pub fn show(ctx: &Rc<Ctx>) {
     let cfg = ctx.cfg.borrow().clone();
-    let win = gtk::Window::builder().title("Linshot preferences").modal(false).resizable(false).build();
+    let win = gtk::Window::builder()
+        .title("Preferences")
+        .modal(false)
+        .default_width(560)
+        .default_height(680)
+        .build();
     win.set_application(Some(&ctx.app));
     win.add_css_class("ls-prefs");
 
-    let grid = gtk::Grid::builder()
-        .row_spacing(10)
-        .column_spacing(12)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
-        .build();
-    let mut row = 0;
-    let mut add = |label: &str, w: &gtk::Widget| {
-        let l = gtk::Label::new(Some(label));
-        l.set_xalign(1.0);
-        l.add_css_class("ls-prefs-label");
-        grid.attach(&l, 0, row, 1, 1);
-        grid.attach(w, 1, row, 1, 1);
-        row += 1;
-    };
+    let header = gtk::HeaderBar::new();
+    header.set_show_title_buttons(false);
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("ls-primary");
+    header.pack_start(&cancel);
+    header.pack_end(&save);
+    win.set_titlebar(Some(&header));
 
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 22);
+    page.add_css_class("ls-prefs-page");
+
+    // ------------------------------------------------------------ capture
+    let g = Group::new("Capture");
+    let (cur, _) = g.switch("Capture mouse pointer", Some("It can still be moved or removed in the editor"), cfg.capture_cursor);
+    let (mag, _) = g.switch("Magnifier while selecting", Some("Zoomed view and colour under the pointer"), cfg.magnifier);
+    page.append(&g.root);
+
+    // ------------------------------------------------------------ after capture
+    let g = Group::new("After capture");
+    let after = dropdown(&ACTIONS.map(|a| a.1), ACTIONS.iter().position(|a| a.0 == cfg.after_capture).unwrap_or(0));
+    g.row("Then", Some("What happens with a new screenshot"), &after);
+    let (notif, _) = g.switch("Notifications", Some("When a screenshot is saved or copied"), cfg.notifications);
+    page.append(&g.root);
+
+    // ------------------------------------------------------------ saving
+    let g = Group::new("Saving");
     let dir_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let dir = gtk::Entry::builder().text(&cfg.output_dir).hexpand(true).width_chars(32).build();
+    let dir = gtk::Entry::builder().text(&cfg.output_dir).width_chars(18).build();
     let browse = gtk::Button::from_icon_name("folder-open-symbolic");
     browse.set_tooltip_text(Some("Choose folder"));
     dir_box.append(&dir);
     dir_box.append(&browse);
-    add("Save folder", dir_box.upcast_ref());
-
-    let pattern = gtk::Entry::builder()
-        .text(&cfg.filename_pattern)
-        .tooltip_text("strftime pattern, e.g. %Y-%m-%d_%H-%M-%S")
-        .build();
-    add("File name", pattern.upcast_ref());
-
-    let format = gtk::DropDown::from_strings(&["PNG", "JPEG"]);
-    format.set_selected(if cfg.extension() == "jpg" { 1 } else { 0 });
-    add("Format", format.upcast_ref());
-
+    g.row("Folder", None, &dir_box);
+    let pattern = gtk::Entry::builder().text(&cfg.filename_pattern).width_chars(18).build();
+    g.row("File name", Some("strftime pattern, e.g. %Y-%m-%d_%H-%M-%S"), &pattern);
+    let format = dropdown(&["PNG", "JPEG"], if cfg.extension() == "jpg" { 1 } else { 0 });
+    g.row("Format", None, &format);
     let quality = gtk::SpinButton::with_range(10.0, 100.0, 1.0);
     quality.set_value(cfg.jpeg_quality as f64);
-    add("JPEG quality", quality.upcast_ref());
+    let quality_row = g.row("JPEG quality", None, &quality);
+    quality_row.set_sensitive(format.selected() == 1);
+    {
+        let quality_row = quality_row.clone();
+        format.connect_selected_notify(move |f| quality_row.set_sensitive(f.selected() == 1));
+    }
+    page.append(&g.root);
 
-    let after = gtk::DropDown::from_strings(&ACTIONS.map(|a| a.1));
-    after.set_selected(ACTIONS.iter().position(|a| a.0 == cfg.after_capture).unwrap_or(0) as u32);
-    add("After capture", after.upcast_ref());
-
-    const THEMES: [(&str, &str); 3] = [("system", "Follow system"), ("light", "Light"), ("dark", "Dark")];
-    let theme = gtk::DropDown::from_strings(&THEMES.map(|t| t.1));
-    theme.set_selected(THEMES.iter().position(|t| t.0 == cfg.theme).unwrap_or(0) as u32);
-    add("Appearance", theme.upcast_ref());
-
-    let notif = gtk::CheckButton::with_label("Show notifications");
-    notif.set_active(cfg.notifications);
-    add("", notif.upcast_ref());
-    let cur = gtk::CheckButton::with_label("Capture mouse pointer");
-    cur.set_active(cfg.capture_cursor);
-    add("", cur.upcast_ref());
-    let mag = gtk::CheckButton::with_label("Show magnifier while selecting");
-    mag.set_active(cfg.magnifier);
-    add("", mag.upcast_ref());
-    let hot = gtk::CheckButton::with_label("Use Print key shortcuts (X11, restart to apply)");
-    hot.set_active(cfg.hotkeys);
-    hot.set_sensitive(capture::is_x11());
-    add("", hot.upcast_ref());
-    let auto = gtk::CheckButton::with_label("Start Linshot when I log in");
-    auto.set_active(config::autostart_path().exists());
-    add("", auto.upcast_ref());
-
+    // ------------------------------------------------------------ shortcuts
+    let g = Group::new("Keyboard shortcuts");
     let sc_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let sc_add = gtk::Button::with_label("Set up Print key shortcuts");
+    let sc_add = gtk::Button::with_label("Set up");
     let sc_remove = gtk::Button::with_label("Remove");
-    // own row under the buttons, wrapped: unwrapped it stretched the window to ~850px
-    let sc_state = gtk::Label::new(None);
-    sc_state.add_css_class("ls-prefs-note");
-    sc_state.set_wrap(true);
-    sc_state.set_xalign(0.0);
-    sc_state.set_max_width_chars(44);
+    sc_add.add_css_class("ls-soft");
+    sc_remove.add_css_class("ls-soft");
     sc_box.append(&sc_add);
     sc_box.append(&sc_remove);
+    let sc_row = g.row("Print key shortcuts", None, &sc_box);
+    let sc_sub = gtk::Label::new(None);
+    sc_sub.set_xalign(0.0);
+    sc_sub.set_wrap(true);
+    sc_sub.set_max_width_chars(40);
+    sc_sub.add_css_class("ls-row-sub");
+    // the row's text column: append the status line under its title
+    if let Some(text) = sc_row.child().and_then(|b| b.first_child()).and_then(|t| t.downcast::<gtk::Box>().ok()) {
+        text.append(&sc_sub);
+    }
     let refresh_sc = {
-        let (sc_add, sc_remove, sc_state) = (sc_add.clone(), sc_remove.clone(), sc_state.clone());
+        let (sc_add, sc_remove, sc_sub) = (sc_add.clone(), sc_remove.clone(), sc_sub.clone());
         move || {
             let ok = shortcuts::supported();
             let on = ok && shortcuts::installed();
-            sc_add.set_sensitive(ok);
-            sc_remove.set_sensitive(on);
-            sc_state.set_visible(!ok || on);
-            sc_state.set_text(if !ok {
-                "not available on this desktop — bind the commands below manually"
+            sc_add.set_visible(ok && !on);
+            sc_remove.set_visible(on);
+            sc_sub.set_text(if !ok {
+                "Not available on this desktop: bind the commands below in your keyboard settings"
             } else if on {
-                "✔ active"
+                "Active: Print, Alt+Print, Shift+Print, Ctrl+Print"
             } else {
-                ""
+                "Registers Print, Alt+Print, Shift+Print and Ctrl+Print with your desktop"
             });
         }
     };
     refresh_sc();
     {
-        let ctx = ctx.clone();
-        let win = win.clone();
-        let refresh = refresh_sc.clone();
+        let (ctx, win, refresh) = (ctx.clone(), win.clone(), refresh_sc.clone());
         sc_add.connect_clicked(move |_| {
             crate::setup_shortcuts(&ctx, Some(&win));
             refresh();
         });
     }
     {
-        let ctx = ctx.clone();
-        let win = win.clone();
-        let refresh = refresh_sc.clone();
+        let (ctx, win, refresh) = (ctx.clone(), win.clone(), refresh_sc.clone());
         sc_remove.connect_clicked(move |_| {
             if let Err(e) = crate::remove_shortcuts(&ctx) {
                 ctx.error(Some(&win), &e);
@@ -135,12 +191,13 @@ pub fn show(ctx: &Rc<Ctx>) {
             refresh();
         });
     }
-    add("Shortcuts", sc_box.upcast_ref());
-    add("", sc_state.upcast_ref());
+    let (hot, hot_row) = g.switch("Grab the Print key directly", Some("X11 only, when the desktop has no shortcut settings; applies after a restart"), cfg.hotkeys);
+    hot_row.set_sensitive(capture::is_x11());
+    page.append(&g.root);
 
     let session = if capture::is_wayland() { "Wayland" } else if capture::is_x11() { "X11" } else { "unknown" };
     let mut text = format!(
-        "Session: {session}.  Shortcut commands for your desktop's keyboard settings:\n\
+        "Session: {session}. Commands for your desktop's keyboard settings:\n\
          linshot region · linshot window · linshot full · linshot last"
     );
     if let Some(h) = shortcuts::manual_hint() {
@@ -149,28 +206,32 @@ pub fn show(ctx: &Rc<Ctx>) {
     }
     let info = gtk::Label::new(Some(&text));
     info.set_selectable(true);
-    info.add_css_class("ls-prefs-note");
-    info.set_max_width_chars(60);
-    info.set_margin_top(4);
-    info.set_xalign(0.0);
     info.set_wrap(true);
-    grid.attach(&info, 0, row, 2, 1);
-    row += 1;
+    info.set_xalign(0.0);
+    info.add_css_class("ls-prefs-note");
+    info.set_margin_top(-12);
+    info.set_margin_start(4);
+    page.append(&info);
 
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_halign(gtk::Align::End);
-    let cancel = gtk::Button::with_label("Cancel");
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("ls-primary");
-    cancel.add_css_class("ls-soft");
-    buttons.append(&cancel);
-    buttons.append(&save);
-    grid.attach(&buttons, 0, row, 2, 1);
-    win.set_child(Some(&grid));
+    // ------------------------------------------------------------ general
+    let g = Group::new("General");
+    let theme = dropdown(&THEMES.map(|t| t.1), THEMES.iter().position(|t| t.0 == cfg.theme).unwrap_or(0));
+    g.row("Appearance", None, &theme);
+    let (auto, _) = g.switch("Start at login", Some("Keeps the tray icon and shortcuts ready"), config::autostart_path().exists());
+    page.append(&g.root);
+
+    let clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    clamp.set_halign(gtk::Align::Center);
+    clamp.set_size_request(480, -1);
+    clamp.append(&page);
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&clamp)
+        .build();
+    win.set_child(Some(&scroller));
 
     {
-        let dir = dir.clone();
-        let win = win.clone();
+        let (dir, win) = (dir.clone(), win.clone());
         browse.connect_clicked(move |_| {
             let initial = std::path::PathBuf::from(config::shellexpand(&dir.text()));
             let dir = dir.clone();
@@ -210,7 +271,6 @@ pub fn show(ctx: &Rc<Ctx>) {
             win2.close();
         });
     }
-    let _ = glib::Propagation::Proceed;
     // don't open with the whole folder path selected in the first entry
     GtkWindowExt::set_focus(&win, Some(&save));
     win.present();

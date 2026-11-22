@@ -26,6 +26,28 @@ window.ls-launcher, window.ls-prefs { background: @ls_header; color: @ls_text; }
 .ls-launcher-hint, .ls-prefs-note { color: @ls_muted; font-size: 0.92em; }
 .ls-prefs-label { color: @ls_muted; }
 .ls-prefs-section { font-weight: 700; font-size: 0.85em; color: @ls_muted; margin-top: 6px; }
+
+/* preferences: grouped cards of rows */
+window.ls-prefs headerbar { background: @ls_header; color: @ls_text; box-shadow: none; border-bottom: 1px solid @ls_border; }
+window.ls-prefs headerbar button { border-radius: 9px; }
+window.ls-prefs scrolledwindow, window.ls-prefs viewport { background: @ls_canvas; }
+.ls-prefs-page { padding: 22px 0 28px; }
+.ls-group-title { font-weight: 700; font-size: 0.95em; margin-left: 4px; }
+list.ls-group {
+  background: @ls_surface; color: @ls_text;
+  border: 1px solid @ls_border; border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+list.ls-group > row { padding: 0; background: none; border-bottom: 1px solid @ls_border; }
+list.ls-group > row:last-child { border-bottom: none; }
+list.ls-group > row:first-child { border-top-left-radius: 12px; border-top-right-radius: 12px; }
+list.ls-group > row:last-child { border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; }
+.ls-row { padding: 10px 14px; min-height: 34px; }
+.ls-row-title { font-weight: 500; }
+.ls-row-sub { color: @ls_muted; font-size: 0.85em; }
+list.ls-group switch:checked { background: @ls_accent; }
+list.ls-group switch:checked slider { background: #ffffff; }
+.ls-width-dot { margin: 0 2px; }
 .ls-launcher button.flat:hover { background: rgba(239,68,68,0.15); color: #ef4444; }
 
 /* ---------- editor ---------- */

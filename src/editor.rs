@@ -478,6 +478,7 @@ const BAR_H: i32 = 72;
 /// Extra room at the top so the zoom pill does not cover the image.
 const TOP_H: i32 = 20;
 
+const PALETTE_NAMES: [&str; 8] = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Black", "White"];
 const PALETTE: [[f64; 4]; 8] = [
     [0.937, 0.267, 0.267, 1.0],
     [0.976, 0.451, 0.086, 1.0],
@@ -521,6 +522,7 @@ struct Ui {
     width: gtk::Scale,
     width_cap: gtk::Label,
     width_val: gtk::Label,
+    width_dot: gtk::DrawingArea,
     font: gtk::SpinButton,
     shadow: gtk::ToggleButton,
     groups: Groups,
@@ -896,11 +898,12 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
         b.set_valign(gtk::Align::Center);
         b.set_halign(gtk::Align::Center);
         b.set_size_request(22, 22);
+        b.set_tooltip_text(Some(PALETTE_NAMES[i]));
         color_g.append(&b);
         swatches.push(b);
     }
     let color = crate::compat::color_button(&to_rgba(cfg.line_color));
-    color.set_tooltip_text(Some("Custom colour"));
+    color.set_tooltip_text(Some("Pick any colour…"));
     color.set_valign(gtk::Align::Center);
     round_color_button(&color);
     color.add_css_class("ls-custom");
@@ -909,7 +912,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     let fill_g = hbox(2);
     let fill_chk = gtk::ToggleButton::new();
     fill_chk.set_child(Some(&prop_glyph("fill")));
-    fill_chk.set_tooltip_text(Some("Fill shape / text background"));
+    fill_chk.set_tooltip_text(Some("Fill the shape (text: background box)"));
     fill_chk.set_active(cfg.fill_enabled);
     let fill = crate::compat::color_button(&to_rgba(cfg.fill_color));
     fill.set_tooltip_text(Some("Fill colour"));
@@ -924,9 +927,38 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     width.set_draw_value(false);
     width.set_value(cfg.line_width);
     width.set_valign(gtk::Align::Center);
+    width.set_tooltip_text(Some("Line width (also: blur / pixelate strength)"));
     let width_val = gtk::Label::new(Some(&format!("{}", cfg.line_width as i32)));
     width_val.add_css_class("ls-value");
+    // live preview: a short stroke as thick as the line, in the current colour
+    let width_dot = gtk::DrawingArea::new();
+    width_dot.set_content_width(30);
+    width_dot.set_content_height(24);
+    width_dot.set_valign(gtk::Align::Center);
+    width_dot.add_css_class("ls-width-dot");
+    {
+        let (width, color) = (width.clone(), color.clone());
+        width_dot.set_draw_func(move |a, cr, w, h| {
+            let c = from_rgba(&color.rgba());
+            let lw = width.value().clamp(1.0, h as f64 - 4.0);
+            let (x0, x1, y) = (lw / 2.0 + 2.0, w as f64 - lw / 2.0 - 2.0, h as f64 / 2.0);
+            cr.set_line_cap(cairo::LineCap::Round);
+            // faint outline first so white / black strokes stay visible on the pill
+            let fg = crate::compat::fg_color(a);
+            cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.28);
+            cr.set_line_width(lw + 2.0);
+            cr.move_to(x0, y);
+            cr.line_to(x1, y);
+            cr.stroke().ok();
+            cr.set_source_rgba(c[0], c[1], c[2], 1.0);
+            cr.set_line_width(lw);
+            cr.move_to(x0, y);
+            cr.line_to(x1, y);
+            cr.stroke().ok();
+        });
+    }
     width_g.append(&width_cap);
+    width_g.append(&width_dot);
     width_g.append(&width);
     width_g.append(&width_val);
 
@@ -942,7 +974,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     let shadow_g = hbox(0);
     let shadow = gtk::ToggleButton::new();
     shadow.set_child(Some(&prop_glyph("shadow")));
-    shadow.set_tooltip_text(Some("Drop shadow"));
+    shadow.set_tooltip_text(Some("Drop shadow under shapes and text"));
     shadow.set_active(cfg.shadow);
     shadow_g.append(&shadow);
 
@@ -1096,6 +1128,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
             width: width.clone(),
             width_cap,
             width_val,
+            width_dot: width_dot.clone(),
             font: font.clone(),
             shadow: shadow.clone(),
             groups: Groups { color: color_g, fill: fill_g, width: width_g, font: font_g, shadow: shadow_g, hint, sep1, sep2 },
@@ -1496,6 +1529,7 @@ impl Editor {
             }
         }
         self.ui.width_val.set_text(&format!("{}", self.ui.width.value() as i32));
+        self.ui.width_dot.queue_draw();
     }
 
     fn set_tool(&self, t: Tool) {
@@ -1723,9 +1757,14 @@ impl Editor {
         self.refresh();
     }
 
-    fn draw(&self, _area: &gtk::DrawingArea, cr: &cairo::Context) {
+    fn draw(&self, area: &gtk::DrawingArea, cr: &cairo::Context) {
         let t = std::time::Instant::now();
-        self.draw_impl(cr);
+        // hairline around the image in the theme's text colour, faint: keeps a
+        // dark screenshot from melting into the dark canvas (and a white one
+        // into the light canvas)
+        let fg = crate::compat::fg_color(area);
+        let edge = [fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.22];
+        self.draw_impl(cr, edge);
         crate::trace("editor draw", t);
     }
 
@@ -1755,7 +1794,7 @@ impl Editor {
         Some(img)
     }
 
-    fn draw_impl(&self, cr: &cairo::Context) {
+    fn draw_impl(&self, cr: &cairo::Context, edge: [f64; 4]) {
         // device pixels per logical pixel (HiDPI), before our own transforms
         let ds = cr.matrix().xx().abs().max(0.01);
         let ed = self.ed.borrow();
@@ -1768,6 +1807,12 @@ impl Editor {
             rounded(cr, PAD - g, PAD - g + 6.0, iw + 2.0 * g, ih + 2.0 * g, 4.0 + g);
             cr.fill().ok();
         }
+        // 1 device pixel, just outside the image
+        let hair = 1.0 / ds;
+        cr.set_source_rgba(edge[0], edge[1], edge[2], edge[3]);
+        cr.set_line_width(hair);
+        cr.rectangle(PAD - hair / 2.0, PAD - hair / 2.0, iw + hair, ih + hair);
+        cr.stroke().ok();
         cr.translate(PAD, PAD);
         cr.rectangle(0.0, 0.0, iw, ih);
         cr.clip();
