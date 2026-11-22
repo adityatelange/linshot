@@ -40,9 +40,9 @@ const TOOLS: &[(Tool, &str, &str, char)] = &[
     (Tool::Pen, "✎", "Freehand (F)", 'f'),
     (Tool::Text, "T", "Text (T)", 't'),
     (Tool::Highlight, "▌", "Highlight (H)", 'h'),
+    (Tool::Counter, "①", "Step counter (I)", 'i'),
     (Tool::Pixelate, "▦", "Pixelate (O)", 'o'),
     (Tool::Blur, "◍", "Blur (B)", 'b'),
-    (Tool::Counter, "①", "Step counter (I)", 'i'),
     (Tool::Crop, "⌗", "Crop (C) — drag, then Enter", 'c'),
 ];
 
@@ -562,124 +562,141 @@ fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     b
 }
 
-/// Crisp, theme-coloured tool glyphs drawn with cairo.
+/// Crisp, theme-coloured tool glyphs drawn with cairo on a 16-unit grid,
+/// like GNOME's symbolic icons: 1.5 px strokes, one shared live area
+/// (about 2..14) so every tool has the same optical size, outlines rather
+/// than solid shapes.
 fn glyph(kind: Tool, size: i32) -> gtk::DrawingArea {
+    use std::f64::consts::{PI, TAU};
     let a = gtk::DrawingArea::new();
     a.set_content_width(size);
     a.set_content_height(size);
     a.set_can_target(false);
     a.set_draw_func(move |w, cr, width, _| {
         let c = crate::compat::fg_color(w);
-        let s = width as f64 / 20.0;
+        let (r, g, b, al) = (c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
+        let s = width as f64 / 16.0;
         cr.scale(s, s);
-        cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, c.alpha() as f64);
-        cr.set_line_width(1.7);
+        cr.set_source_rgba(r, g, b, al);
+        cr.set_line_width(1.5);
         cr.set_line_cap(cairo::LineCap::Round);
         cr.set_line_join(cairo::LineJoin::Round);
         let stroke = |cr: &cairo::Context| {
             cr.stroke().ok();
         };
+        let faint = |cr: &cairo::Context, a: f64| cr.set_source_rgba(r, g, b, al * a);
         match kind {
             Tool::Select | Tool::Pointer => {
-                cr.move_to(5.5, 3.0);
-                cr.line_to(5.5, 16.0);
-                cr.line_to(8.8, 12.8);
-                cr.line_to(11.2, 17.8);
-                cr.line_to(13.3, 16.8);
-                cr.line_to(10.9, 11.9);
-                cr.line_to(15.2, 11.9);
+                cr.move_to(4.0, 2.0);
+                cr.line_to(4.0, 13.0);
+                cr.line_to(6.9, 10.3);
+                cr.line_to(8.9, 14.0);
+                cr.line_to(10.6, 13.1);
+                cr.line_to(8.7, 9.5);
+                cr.line_to(12.5, 9.5);
                 cr.close_path();
-                cr.fill().ok();
+                cr.fill_preserve().ok();
+                cr.set_line_width(1.0);
+                stroke(cr);
             }
             Tool::Rect => {
-                rounded(cr, 3.5, 5.0, 13.0, 10.0, 2.0);
+                rounded(cr, 2.25, 3.25, 11.5, 9.5, 1.75);
                 stroke(cr);
             }
             Tool::Ellipse => {
                 cr.save().ok();
-                cr.translate(10.0, 10.0);
-                cr.scale(7.0, 5.5);
-                cr.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+                cr.translate(8.0, 8.0);
+                cr.scale(5.75, 4.75);
+                cr.arc(0.0, 0.0, 1.0, 0.0, TAU);
                 cr.restore().ok();
                 stroke(cr);
             }
             Tool::Line => {
-                cr.move_to(4.0, 16.0);
-                cr.line_to(16.0, 4.0);
+                cr.move_to(3.0, 13.0);
+                cr.line_to(13.0, 3.0);
                 stroke(cr);
             }
             Tool::Arrow => {
-                cr.move_to(4.0, 16.0);
-                cr.line_to(15.5, 4.5);
-                cr.move_to(9.5, 4.0);
-                cr.line_to(16.0, 4.0);
-                cr.line_to(16.0, 10.5);
+                cr.move_to(3.0, 13.0);
+                cr.line_to(12.5, 3.5);
+                cr.move_to(7.0, 3.0);
+                cr.line_to(13.0, 3.0);
+                cr.line_to(13.0, 9.0);
                 stroke(cr);
             }
             Tool::Pen => {
-                cr.move_to(3.0, 15.0);
-                cr.curve_to(5.5, 7.0, 8.5, 18.0, 11.5, 10.0);
-                cr.curve_to(13.0, 6.0, 15.0, 7.0, 17.0, 4.5);
+                cr.move_to(2.5, 12.0);
+                cr.curve_to(4.5, 5.0, 7.0, 14.5, 9.5, 8.0);
+                cr.curve_to(10.7, 5.0, 12.0, 4.6, 13.5, 3.5);
                 stroke(cr);
             }
             Tool::Text => {
-                cr.set_line_width(2.0);
-                cr.move_to(4.5, 5.0);
-                cr.line_to(15.5, 5.0);
-                cr.move_to(10.0, 5.0);
-                cr.line_to(10.0, 16.0);
+                cr.move_to(3.5, 3.25);
+                cr.line_to(12.5, 3.25);
+                cr.move_to(8.0, 3.25);
+                cr.line_to(8.0, 13.0);
+                cr.move_to(6.25, 13.0);
+                cr.line_to(9.75, 13.0);
                 stroke(cr);
             }
             Tool::Highlight => {
-                cr.move_to(6.0, 12.5);
-                cr.line_to(12.0, 3.5);
-                cr.line_to(16.0, 6.3);
-                cr.line_to(10.0, 15.3);
+                // marker nib above a translucent stroke
+                cr.move_to(5.25, 8.75);
+                cr.line_to(9.75, 2.25);
+                cr.line_to(12.5, 4.2);
+                cr.line_to(8.0, 10.7);
                 cr.close_path();
+                cr.move_to(5.25, 8.75);
+                cr.line_to(4.25, 10.75);
+                cr.line_to(6.5, 10.75);
                 stroke(cr);
-                cr.set_line_width(3.0);
-                cr.move_to(3.5, 17.5);
-                cr.line_to(16.5, 17.5);
-                cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, 0.45);
+                faint(cr, 0.45);
+                cr.set_line_width(2.0);
+                cr.move_to(3.0, 13.25);
+                cr.line_to(13.0, 13.25);
+                stroke(cr);
+            }
+            Tool::Counter => {
+                cr.arc(8.0, 8.0, 5.5, 0.0, TAU);
+                stroke(cr);
+                cr.move_to(6.7, 6.4);
+                cr.line_to(8.3, 5.2);
+                cr.line_to(8.3, 10.8);
                 stroke(cr);
             }
             Tool::Pixelate => {
-                for (i, (x, y)) in [(3.0, 3.0), (8.0, 3.0), (13.0, 3.0), (3.0, 8.0), (8.0, 8.0), (13.0, 8.0), (3.0, 13.0), (8.0, 13.0), (13.0, 13.0)]
-                    .iter()
-                    .enumerate()
-                {
-                    let alpha = if i % 2 == 0 { 1.0 } else { 0.4 };
-                    cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, alpha);
-                    rounded(cr, *x, *y, 4.2, 4.2, 1.0);
-                    cr.fill().ok();
-                }
+                // outlined square with a 2x2 checker inside
+                rounded(cr, 2.5, 2.5, 11.0, 11.0, 2.0);
+                stroke(cr);
+                cr.save().ok();
+                rounded(cr, 2.5, 2.5, 11.0, 11.0, 2.0);
+                cr.clip();
+                faint(cr, 0.6);
+                cr.rectangle(2.5, 2.5, 5.5, 5.5);
+                cr.rectangle(8.0, 8.0, 5.5, 5.5);
+                cr.fill().ok();
+                cr.restore().ok();
             }
             Tool::Blur => {
-                for (r, a) in [(3.0, 1.0), (5.6, 0.55), (8.0, 0.25)] {
-                    cr.set_source_rgba(c.red() as f64, c.green() as f64, c.blue() as f64, a);
-                    cr.arc(10.0, 10.0, r, 0.0, std::f64::consts::TAU);
-                    if r < 4.0 {
-                        cr.fill().ok();
-                    } else {
-                        stroke(cr);
-                    }
-                }
-            }
-            Tool::Counter => {
-                cr.arc(10.0, 10.0, 7.5, 0.0, std::f64::consts::TAU);
+                // drop with a faint inner ring
+                cr.move_to(8.0, 2.0);
+                cr.curve_to(9.6, 4.3, 12.5, 6.9, 12.5, 9.5);
+                cr.arc(8.0, 9.5, 4.5, 0.0, PI);
+                cr.curve_to(3.5, 6.9, 6.4, 4.3, 8.0, 2.0);
+                cr.close_path();
                 stroke(cr);
-                cr.move_to(8.3, 7.6);
-                cr.line_to(10.6, 6.0);
-                cr.line_to(10.6, 14.2);
+                faint(cr, 0.5);
+                cr.set_line_width(1.25);
+                cr.arc(8.0, 9.6, 2.1, 0.0, TAU);
                 stroke(cr);
             }
             Tool::Crop => {
-                cr.move_to(6.0, 2.5);
-                cr.line_to(6.0, 14.0);
-                cr.line_to(17.5, 14.0);
-                cr.move_to(2.5, 6.0);
-                cr.line_to(14.0, 6.0);
-                cr.line_to(14.0, 17.5);
+                cr.move_to(5.0, 2.0);
+                cr.line_to(5.0, 11.0);
+                cr.line_to(14.0, 11.0);
+                cr.move_to(2.0, 5.0);
+                cr.line_to(11.0, 5.0);
+                cr.line_to(11.0, 14.0);
                 stroke(cr);
             }
         }
@@ -821,7 +838,7 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     overlay.set_child(Some(&scroller));
 
     // ---------------------------------------------------------------- tool dock
-    let dock = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let dock = gtk::Box::new(gtk::Orientation::Vertical, 4);
     dock.add_css_class("ls-dock-tools");
     // scrolls instead of being clipped when the window is too short for all tools
     let dock_frame = gtk::ScrolledWindow::builder()
@@ -839,12 +856,17 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     dock_frame.set_margin_bottom(BAR_H / 2);
     let mut tools = Vec::new();
     let mut first: Option<gtk::ToggleButton> = None;
+    // groups (select · shapes · annotate · redact · crop) are set apart by
+    // space, not lines, as GNOME's HIG asks for toolbars
     for (t, _, tip, _) in TOOLS {
-        if matches!(t, Tool::Rect | Tool::Text | Tool::Crop) {
-            dock.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        if matches!(t, Tool::Rect | Tool::Text | Tool::Pixelate | Tool::Crop) {
+            let gap = gtk::Separator::new(gtk::Orientation::Horizontal);
+            gap.add_css_class("spacer");
+            dock.append(&gap);
         }
         let b = gtk::ToggleButton::new();
-        b.set_child(Some(&glyph(*t, 20)));
+        // 16 px, the size GNOME's symbolic icons are drawn for
+        b.set_child(Some(&glyph(*t, 16)));
         b.set_tooltip_text(Some(tip));
         b.add_css_class("ls-tool");
         if let Some(f) = &first {

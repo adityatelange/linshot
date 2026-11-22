@@ -50,22 +50,27 @@ window.ls-editor headerbar button { border-radius: 9px; }
   border: 1px solid @ls_border;
   box-shadow: 0 10px 30px rgba(0,0,0,0.25), 0 1px 3px rgba(0,0,0,0.18);
 }
-.ls-dock { border-radius: 18px; }
+.ls-dock { border-radius: 14px; background: @ls_dock; }
 .ls-dock > viewport { background: none; }
-.ls-dock-tools { padding: 6px; }
+.ls-dock-tools { padding: 5px; }
 .ls-pill { border-radius: 999px; padding: 5px 8px; }
 
+/* tool palette in the style of a libadwaita toggle group: flat buttons on a
+   floating card, the chosen one raised and tinted with the accent colour */
 .ls-tool {
-  min-width: 40px; min-height: 40px; padding: 0;
-  border-radius: 12px; border: none; box-shadow: none;
-  background: none; color: @ls_text;
-  transition: background 120ms ease;
+  min-width: 36px; min-height: 36px; padding: 0;
+  border-radius: 10px; border: none; box-shadow: none;
+  background: none; color: alpha(@ls_text, 0.8);
+  transition: background 150ms ease, color 150ms ease, box-shadow 150ms ease;
 }
-.ls-tool:hover { background: @ls_hover; }
-.ls-tool:checked { background: @ls_accent; color: #ffffff; }
-.ls-tool:checked:hover { background: @ls_accent; }
-
-.ls-dock-tools separator { margin: 5px 8px; min-height: 1px; background: @ls_border; }
+.ls-tool:hover { background: @ls_hover; color: @ls_text; }
+.ls-tool:active { background: @ls_track; }
+.ls-tool:checked, .ls-tool:checked:hover {
+  background: @ls_raised; color: @ls_accent;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.22), 0 0 0 1px @ls_border;
+}
+/* every group gap is the same fixed 6 px (+ the dock's 4 px spacing) */
+.ls-dock-tools separator.spacer { min-height: 6px; margin: 0; background: none; }
 .ls-pill separator { margin: 6px 4px; min-width: 1px; background: @ls_border; }
 
 .ls-pill button {
@@ -151,6 +156,8 @@ const LIGHT: &str = r#"
 @define-color ls_muted #6b6e78;
 @define-color ls_hover rgba(0,0,0,0.06);
 @define-color ls_track rgba(0,0,0,0.14);
+@define-color ls_raised #ffffff;
+@define-color ls_dock rgba(240,240,244,0.97);
 @define-color ls_accent #1f9d5f;
 @define-color ls_accent_soft rgba(31,157,95,0.14);
 @define-color ls_toast rgba(28,29,33,0.94);
@@ -165,6 +172,8 @@ const DARK: &str = r#"
 @define-color ls_muted #9b9ea8;
 @define-color ls_hover rgba(255,255,255,0.08);
 @define-color ls_track rgba(255,255,255,0.16);
+@define-color ls_raised #3d3f46;
+@define-color ls_dock rgba(30,31,35,0.96);
 @define-color ls_accent #22a565;
 @define-color ls_accent_soft rgba(34,165,101,0.2);
 @define-color ls_toast rgba(14,15,17,0.94);
@@ -172,6 +181,26 @@ const DARK: &str = r#"
 
 thread_local! {
     static TOKENS: gtk::CssProvider = gtk::CssProvider::new();
+    static STATE: std::cell::Cell<(bool, Option<[f64; 3]>)> = const { std::cell::Cell::new((false, None)) };
+}
+
+/// Token sheet for the theme, with the desktop's accent colour (if it has
+/// one) in place of Linshot's green.
+fn tokens(dark: bool, accent: Option<[f64; 3]>) -> String {
+    let mut css = String::from(if dark { DARK } else { LIGHT });
+    if let Some([r, g, b]) = accent {
+        let (r, g, b) = ((r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8);
+        let soft = if dark { 0.2 } else { 0.14 };
+        css.push_str(&format!(
+            "@define-color ls_accent rgb({r},{g},{b});\n@define-color ls_accent_soft rgba({r},{g},{b},{soft});\n"
+        ));
+    }
+    css
+}
+
+fn reload() {
+    let (dark, accent) = STATE.with(|s| s.get());
+    TOKENS.with(|t| crate::compat::load_css(t, &tokens(dark, accent)));
 }
 
 pub fn init() {
@@ -186,5 +215,12 @@ pub fn init() {
 }
 
 pub fn set_dark(dark: bool) {
-    TOKENS.with(|t| crate::compat::load_css(t, if dark { DARK } else { LIGHT }));
+    STATE.with(|s| s.set((dark, s.get().1)));
+    reload();
+}
+
+/// The desktop's accent colour (sRGB, 0..1), or None for Linshot's own.
+pub fn set_accent(accent: Option<[f64; 3]>) {
+    STATE.with(|s| s.set((s.get().0, accent)));
+    reload();
 }

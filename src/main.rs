@@ -308,12 +308,19 @@ fn startup(app: &gtk::Application) {
 
     *ctx.tray.borrow_mut() = Some(tray::spawn(tx.clone()));
     apply_theme(&ctx);
-    let (ttx, trx) = async_channel::unbounded::<bool>();
+    let (ttx, trx) = async_channel::unbounded::<theme::Appearance>();
     theme::spawn_watcher(ttx);
     {
         let ctx = ctx.clone();
         glib::spawn_future_local(async move {
-            while let Ok(dark) = trx.recv().await {
+            while let Ok(ev) = trx.recv().await {
+                let dark = match ev {
+                    theme::Appearance::Accent(a) => {
+                        style::set_accent(a);
+                        continue;
+                    }
+                    theme::Appearance::Dark(d) => d,
+                };
                 ctx.system_dark.set(dark);
                 apply_theme(&ctx);
                 let panel_dark = dark || tray::panel_always_dark();
