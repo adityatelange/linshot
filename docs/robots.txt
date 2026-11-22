@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://adityatelange.github.io/linshot/sitemap.xml

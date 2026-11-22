@@ -7,12 +7,16 @@
 A screenshot and annotation tool for Linux, written in Rust + GTK 4.
 Works on **X11** and **Wayland** (GNOME, KDE Plasma, Cinnamon, and wlroots compositors such as Wayfire, Sway, Hyprland, labwc).
 
-![Editor (dark)](docs/editor.png)
-![Editor (light)](docs/editor-light.png)
+Website: https://adityatelange.github.io/linshot/
+
+![Editor (dark)](docs/images/editor-dark.png)
+![Editor (light)](docs/images/editor-light.png)
 
 | Region selection | Launcher |
 |---|---|
-| ![Region selection](docs/region-select.png) | ![Launcher](docs/launcher.png) |
+| ![Region selection](docs/images/region-select.png) | ![Launcher](docs/images/launcher.png) |
+| **Preferences** | **Delayed capture** |
+| ![Preferences](docs/images/preferences.png) | ![Countdown](docs/images/countdown.png) |
 
 ## Features
 

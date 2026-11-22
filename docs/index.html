@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linshot: screenshot and annotation tool for Linux (X11 and Wayland)</title>
+<meta name="description" content="Linshot is a free, open-source screenshot and annotation tool for Linux. Capture a region, window or full screen on X11 and Wayland, then add arrows, text, highlights, blur and numbered steps.">
+<meta name="keywords" content="linux screenshot tool, wayland screenshot, x11 screenshot, screenshot annotation, gtk4, rust, gnome, kde, wayfire, sway, hyprland, cinnamon">
+<meta name="author" content="Aditya Telange">
+<meta name="theme-color" content="#1f9d5f">
+<link rel="canonical" href="https://adityatelange.github.io/linshot/">
+<link rel="icon" type="image/svg+xml" href="images/logo.svg">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Linshot">
+<meta property="og:title" content="Linshot: screenshot and annotation tool for Linux">
+<meta property="og:description" content="Capture a region, window or full screen on X11 and Wayland, then annotate with arrows, text, highlights, blur and numbered steps.">
+<meta property="og:url" content="https://adityatelange.github.io/linshot/">
+<meta property="og:image" content="https://adityatelange.github.io/linshot/images/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Linshot editor annotating a screenshot">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Linshot: screenshot and annotation tool for Linux">
+<meta name="twitter:description" content="Capture and annotate screenshots on X11 and Wayland. Free and open source.">
+<meta name="twitter:image" content="https://adityatelange.github.io/linshot/images/og.png">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Linshot",
+  "description": "Screenshot and annotation tool for Linux (X11 and Wayland).",
+  "url": "https://adityatelange.github.io/linshot/",
+  "downloadUrl": "https://github.com/adityatelange/linshot/releases/latest",
+  "applicationCategory": "MultimediaApplication",
+  "operatingSystem": "Linux",
+  "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+  "author": { "@type": "Person", "name": "Aditya Telange" },
+  "image": "https://adityatelange.github.io/linshot/images/editor-dark.png",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+
+<style>
+:root {
+  --bg: #f7f7f9; --surface: #ffffff; --text: #1c1d21; --muted: #5f636d;
+  --border: rgba(0,0,0,.08); --accent: #1f9d5f; --accent-soft: rgba(31,157,95,.12);
+  --code: #eef0f3; --shadow: 0 20px 50px rgba(0,0,0,.12), 0 2px 6px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131417; --surface: #1d1e22; --text: #ececf1; --muted: #a0a3ad;
+    --border: rgba(255,255,255,.08); --accent: #2bb673; --accent-soft: rgba(43,182,115,.14);
+    --code: #25272c; --shadow: 0 20px 50px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.3);
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Cantarell, Ubuntu, "Noto Sans", sans-serif;
+}
+a { color: var(--accent); }
+img { max-width: 100%; height: auto; display: block; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+
+header.top { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); text-decoration: none; }
+.brand img { width: 28px; height: 28px; }
+nav a { color: var(--muted); text-decoration: none; margin-left: 20px; font-size: 15px; }
+nav a:hover { color: var(--text); }
+
+.hero { text-align: center; padding: 48px 0 28px; }
+.hero h1 { font-size: clamp(32px, 6vw, 56px); line-height: 1.1; letter-spacing: -.02em; margin: 0 0 16px; }
+.hero h1 span { color: var(--accent); }
+.hero p { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 640px; margin: 0 auto 28px; }
+.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn {
+  display: inline-block; padding: 12px 22px; border-radius: 12px; font-weight: 600;
+  text-decoration: none; border: 1px solid var(--border);
+}
+.btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
+.btn.ghost { background: var(--surface); color: var(--text); }
+.chips { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 22px; }
+.chip { font-size: 13px; padding: 5px 12px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+.shot { margin: 36px auto 0; border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); border: 1px solid var(--border); }
+.shot img { width: 100%; }
+.light-only { display: block; } .dark-only { display: none; }
+@media (prefers-color-scheme: dark) { .light-only { display: none; } .dark-only { display: block; } }
+
+section { padding: 64px 0 0; }
+h2 { font-size: clamp(24px, 3.4vw, 32px); letter-spacing: -.01em; margin: 0 0 8px; }
+.lead { color: var(--muted); margin: 0 0 28px; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+.card h3 { margin: 0 0 6px; font-size: 17px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+.gallery { display: grid; gap: 20px; grid-template-columns: 1fr; align-items: start; }
+@media (min-width: 760px) {
+  .gallery { grid-template-columns: 1.5fr 1fr; grid-template-areas: "region region" "launcher prefs" "countdown prefs"; }
+  .g-region { grid-area: region; } .g-launcher { grid-area: launcher; }
+  .g-prefs { grid-area: prefs; } .g-countdown { grid-area: countdown; }
+}
+figure { margin: 0; }
+figure .shot { margin: 0; }
+figcaption { color: var(--muted); font-size: 14px; margin-top: 10px; text-align: center; }
+
+pre, code { font-family: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", monospace; font-size: 14px; }
+code { background: var(--code); padding: 2px 6px; border-radius: 6px; }
+pre { background: var(--code); padding: 14px 16px; border-radius: 12px; overflow-x: auto; margin: 0 0 12px; }
+pre code { background: none; padding: 0; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; }
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; }
+
+footer { padding: 56px 0 40px; color: var(--muted); font-size: 14px; text-align: center; }
+@media (max-width: 560px) { nav a:not(.gh) { display: none; } .hero { padding-top: 28px; } section { padding-top: 48px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="./"><img src="images/logo.svg" alt="" width="28" height="28">Linshot</a>
+    <nav aria-label="Main">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#shortcuts">Shortcuts</a>
+      <a class="gh" href="https://github.com/adityatelange/linshot">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="hero">
+      <h1>Screenshots on Linux,<br><span>captured and annotated.</span></h1>
+      <p>Linshot is a free, open-source screenshot tool for X11 and Wayland. Pick a region or window, then add arrows, text, highlights, blur and numbered steps before you save or copy.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/adityatelange/linshot/releases/latest">Download .deb</a>
+        <a class="btn ghost" href="https://github.com/adityatelange/linshot">View source</a>
+      </div>
+      <div class="chips">
+        <span class="chip">X11</span><span class="chip">Wayland</span><span class="chip">GNOME</span><span class="chip">KDE</span>
+        <span class="chip">Cinnamon</span><span class="chip">Wayfire · Sway · Hyprland</span><span class="chip">GPL-3.0</span>
+      </div>
+      <div class="shot">
+        <img class="dark-only" src="images/editor-dark.png" width="1440" height="900" alt="Linshot editor in dark mode with a box, numbered steps, a blurred token and an arrow on a screenshot">
+        <img class="light-only" src="images/editor-light.png" width="1440" height="900" alt="Linshot editor in light mode with a box, numbered steps, a blurred token and an arrow on a screenshot">
+      </div>
+    </div>
+
+    <section id="features" aria-labelledby="features-h">
+      <h2 id="features-h">Features</h2>
+      <p class="lead">Everything for a quick, clear screenshot, nothing in the way.</p>
+      <div class="grid">
+        <div class="card"><h3>Every capture mode</h3><p>Region, window, active window, full screen across monitors, last region, and delayed capture with a visible countdown.</p></div>
+        <div class="card"><h3>Precise selection</h3><p>Frozen screen, crosshair and pixel magnifier with colour readout. Click a window to snap to it.</p></div>
+        <div class="card"><h3>Annotation editor</h3><p>Rectangle, ellipse, line, arrow, freehand, text, highlighter, numbered steps and crop, with undo and zoom.</p></div>
+        <div class="card"><h3>Hide what matters</h3><p>Pixelate or blur passwords, tokens and personal data before sharing.</p></div>
+        <div class="card"><h3>Movable mouse pointer</h3><p>The pointer is captured as its own object: move it or delete it after the shot.</p></div>
+        <div class="card"><h3>Fits your desktop</h3><p>Follows light/dark mode and your accent colour, sits in the tray, and registers the Print key for you.</p></div>
+      </div>
+    </section>
+
+    <section aria-labelledby="gallery-h">
+      <h2 id="gallery-h">A closer look</h2>
+      <p class="lead">Selector, launcher, preferences and the delay countdown.</p>
+      <div class="gallery">
+        <figure class="g-region"><div class="shot"><img src="images/region-select.png" width="1440" height="900" loading="lazy" alt="Region selector with a size label and a magnifier over a dashboard"></div><figcaption>Region selection with magnifier</figcaption></figure>
+        <figure class="g-launcher"><div class="shot"><img src="images/launcher.png" width="640" height="340" loading="lazy" alt="Linshot launcher with Region, Window, Full screen and Last region buttons"></div><figcaption>Launcher</figcaption></figure>
+        <figure class="g-prefs"><div class="shot"><img src="images/preferences.png" width="600" height="860" loading="lazy" alt="Linshot preferences grouped into Capture, After capture, Saving and shortcuts"></div><figcaption>Preferences</figcaption></figure>
+        <figure class="g-countdown"><div class="shot"><img src="images/countdown.png" width="520" height="220" loading="lazy" alt="Countdown bubble showing seconds until a delayed capture"></div><figcaption>Delayed capture countdown</figcaption></figure>
+      </div>
+    </section>
+
+    <section id="install" aria-labelledby="install-h">
+      <h2 id="install-h">Install</h2>
+      <p class="lead">Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS and other derivatives (amd64 and arm64).</p>
+      <pre><code>sudo apt install ./linshot_0.1.0_amd64.deb</code></pre>
+      <p>Download the package from the <a href="https://github.com/adityatelange/linshot/releases/latest">latest release</a>. Other distributions can <a href="https://github.com/adityatelange/linshot#build">build from source</a> (Rust and GTK 4.6+).</p>
+    </section>
+
+    <section id="shortcuts" aria-labelledby="shortcuts-h">
+      <h2 id="shortcuts-h">Keyboard shortcuts</h2>
+      <p class="lead">Linshot offers to register these with your desktop on first start (GNOME, Cinnamon, Xfce, Wayfire). Elsewhere, bind the commands yourself.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Action</th><th>Key</th><th>Command</th></tr></thead>
+          <tbody>
+            <tr><td>Region</td><td>Print</td><td><code>linshot region</code></td></tr>
+            <tr><td>Window</td><td>Alt+Print</td><td><code>linshot window</code></td></tr>
+            <tr><td>Full screen</td><td>Ctrl+Print</td><td><code>linshot full</code></td></tr>
+            <tr><td>Last region</td><td>Shift+Print</td><td><code>linshot last</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Linshot is free software under the <a href="https://www.gnu.org/licenses/gpl-3.0.html">GPL-3.0-or-later</a>.
+    © 2026 Aditya Telange · <a href="https://github.com/adityatelange/linshot">GitHub</a>
+  </footer>
+</div>
+</body>
+</html>
