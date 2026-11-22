@@ -1,6 +1,6 @@
 [package]
 name = "linshot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Screenshot and annotation tool for Linux (X11 and Wayland)"
 license = "GPL-3.0-or-later"

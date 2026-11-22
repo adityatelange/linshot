@@ -28,6 +28,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      # a v* tag must match Cargo.toml's version, or the packages would be
+      # named and versioned after the old one
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v (bump it first)"
+            exit 1
+          fi
       - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
       - uses: dtolnay/rust-toolchain@stable
       # reuses compiled dependencies between runs (tests run in ci.yml)
