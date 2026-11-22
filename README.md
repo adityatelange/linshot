@@ -26,7 +26,7 @@ Website: https://adityatelange.github.io/linshot/
 ## Install
 
 ```bash
-sudo apt install ./dist/linshot_0.2.0_amd64.deb
+sudo apt install ./dist/linshot_0.3.0_amd64.deb
 ```
 
 Requires GTK ≥ 4.6 and glibc ≥ 2.35: Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS 22.04+,
