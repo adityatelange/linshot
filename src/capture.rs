@@ -220,6 +220,12 @@ fn grab_wayland(interactive: bool, cursor: bool) -> Result<Grab, String> {
     }
     match portal_screenshot(interactive) {
         Ok(path) => return Ok(Grab::File(path)),
+        // the user said no (closed the picker or the permission prompt):
+        // don't take a full-screen shot behind their back with another tool
+        Err(e) if e == "cancelled" => return Err(e),
+        // asked to let the user pick: another tool would return the whole
+        // screen as if it were the pick; fail so the caller uses the overlay
+        Err(e) if interactive => return Err(format!("portal: {e}")),
         Err(e) => errors.push(format!("portal: {e}")),
     }
     if has_cmd("grim") {
@@ -553,6 +559,53 @@ pub fn x11_active_window() -> Option<(i32, i32, i32, i32)> {
         return None;
     }
     window_rect(&conn, root, w, atom("_NET_FRAME_EXTENTS")?, atom("_GTK_FRAME_EXTENTS")?)
+}
+
+/// Whether an X11 window manager is running (it sets _NET_SUPPORTING_WM_CHECK
+/// on the root). Without one, fullscreen requests do nothing and windows stay
+/// where and as large as they were created.
+pub fn x11_has_wm() -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::*;
+    let check = || -> Option<bool> {
+        let (conn, sn) = x11rb::connect(None).ok()?;
+        let root = conn.setup().roots[sn].root;
+        let a = conn.intern_atom(false, b"_NET_SUPPORTING_WM_CHECK").ok()?.reply().ok()?.atom;
+        let r = conn.get_property(false, root, a, AtomEnum::WINDOW, 0, 1).ok()?.reply().ok()?;
+        Some(r.value32().and_then(|mut v| v.next()).is_some_and(|w| w != 0))
+    };
+    check().unwrap_or(true)
+}
+
+/// Moves and resizes this process's top-level window titled `title` (device
+/// pixels). Only for when no window manager places windows; returns false
+/// if the window isn't there (yet).
+pub fn x11_place_own_window(title: &str, x: i32, y: i32, w: u32, h: u32) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::*;
+    let place = || -> Option<bool> {
+        let (conn, sn) = x11rb::connect(None).ok()?;
+        let root = conn.setup().roots[sn].root;
+        let atom = |n: &str| conn.intern_atom(false, n.as_bytes()).ok()?.reply().ok().map(|r| r.atom);
+        let (pid_a, name_a, utf8) = (atom("_NET_WM_PID")?, atom("_NET_WM_NAME")?, atom("UTF8_STRING")?);
+        let me = std::process::id();
+        for win in conn.query_tree(root).ok()?.reply().ok()?.children {
+            let pid = conn.get_property(false, win, pid_a, AtomEnum::CARDINAL, 0, 1).ok()?.reply().ok()?;
+            if pid.value32().and_then(|mut v| v.next()) != Some(me) {
+                continue;
+            }
+            let name = conn.get_property(false, win, name_a, utf8, 0, 256).ok()?.reply().ok()?;
+            if name.value != title.as_bytes() {
+                continue;
+            }
+            let aux = ConfigureWindowAux::new().x(x).y(y).width(w).height(h);
+            conn.configure_window(win, &aux).ok()?;
+            conn.flush().ok()?;
+            return Some(true);
+        }
+        Some(false)
+    };
+    place().unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 use cairo::ImageSurface;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -215,8 +215,18 @@ pub fn select(
         *watch.borrow_mut() = Some((list, id));
     }
 
-    for (mon, g) in mons.iter().cloned() {
-        let win = gtk::Window::builder().application(app).decorated(false).title("Linshot selection").build();
+    // no X11 window manager: fullscreen requests are ignored, so size and
+    // place the windows ourselves (each needs its own title to find it)
+    let unmanaged = crate::capture::is_x11() && !crate::capture::x11_has_wm();
+    for (i, (mon, g)) in mons.iter().cloned().enumerate() {
+        let title = if unmanaged { format!("Linshot selection {}", i + 1) } else { "Linshot selection".to_string() };
+        let win = gtk::Window::builder()
+            .application(app)
+            .decorated(false)
+            .title(&title)
+            .default_width(g.w as i32)
+            .default_height(g.h as i32)
+            .build();
         win.add_css_class("linshot-overlay");
         let area = gtk::DrawingArea::new();
         area.set_cursor_from_name(Some("crosshair"));
@@ -349,6 +359,20 @@ pub fn select(
 
         win.fullscreen_on_monitor(&mon);
         win.present();
+        if unmanaged {
+            let scale = mon.scale_factor() as f64;
+            let (x, y, w, h) = ((g.x * scale) as i32, (g.y * scale) as i32, (g.w * scale) as u32, (g.h * scale) as u32);
+            // the window exists on the server once GDK has flushed: retry briefly
+            let tries = Rc::new(Cell::new(0));
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                tries.set(tries.get() + 1);
+                if crate::capture::x11_place_own_window(&title, x, y, w, h) || tries.get() >= 25 {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        }
         area.grab_focus();
         areas.borrow_mut().push(area);
         wins.borrow_mut().push(win);

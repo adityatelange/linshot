@@ -47,7 +47,7 @@ impl Default for Config {
             .unwrap_or_else(|| PathBuf::from("."));
         Config {
             output_dir: pics.join("Screenshots").to_string_lossy().into_owned(),
-            filename_pattern: "Screenshot_%Y-%m-%d_%H-%M-%S".into(),
+            filename_pattern: DEFAULT_PATTERN.into(),
             format: "png".into(),
             jpeg_quality: 90,
             after_capture: AfterCapture::Editor,
@@ -80,8 +80,12 @@ impl Config {
     pub fn load() -> Config {
         let p = config_path();
         let Ok(s) = std::fs::read_to_string(&p) else { return Config::default() };
-        match serde_json::from_str(&s) {
-            Ok(c) => c,
+        match serde_json::from_str::<Config>(&s) {
+            Ok(mut c) => {
+                // hand-edited values the encoder would reject
+                c.jpeg_quality = c.jpeg_quality.clamp(1, 100);
+                c
+            }
             Err(e) => {
                 // keep the broken file for the user instead of overwriting it on the next save
                 let bak = p.with_extension("json.bad");
@@ -116,8 +120,7 @@ impl Config {
     pub fn next_output_path(&self) -> PathBuf {
         let dir = PathBuf::from(shellexpand(&self.output_dir));
         let _ = std::fs::create_dir_all(&dir);
-        let name = chrono::Local::now().format(&self.filename_pattern).to_string();
-        let name = name.replace('/', "_");
+        let name = file_stem(&self.filename_pattern, chrono::Local::now());
         let ext = self.extension();
         let mut path = dir.join(format!("{name}.{ext}"));
         let mut n = 1;
@@ -151,10 +154,38 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8], sync: bool) -> std::io:
     r
 }
 
+pub const DEFAULT_PATTERN: &str = "Screenshot_%Y-%m-%d_%H-%M-%S";
+
+/// Expands a strftime pattern, or None if it is invalid (e.g. "%Q" or a
+/// trailing "%"): chrono reports those as a formatting error, and
+/// `to_string()` on them panics.
+pub fn format_pattern(pattern: &str, t: chrono::DateTime<chrono::Local>) -> Option<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    write!(out, "{}", t.format(pattern)).ok()?;
+    Some(out)
+}
+
+/// The file name (without extension) for a capture taken at `t`. Falls back
+/// to the default pattern when the configured one is invalid or empty.
+fn file_stem(pattern: &str, t: chrono::DateTime<chrono::Local>) -> String {
+    format_pattern(pattern, t)
+        .map(|n| n.replace('/', "_"))
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| {
+            eprintln!("linshot: invalid file name pattern {pattern:?}, using the default");
+            format_pattern(DEFAULT_PATTERN, t).unwrap_or_default()
+        })
+}
+
 pub fn shellexpand(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(h) = dirs::home_dir() {
-            return h.join(rest).to_string_lossy().into_owned();
+    let home = || dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    for prefix in ["~", "$HOME", "${HOME}"] {
+        if let Some(rest) = s.strip_prefix(prefix)
+            && (rest.is_empty() || rest.starts_with('/'))
+            && let Some(h) = home()
+        {
+            return format!("{h}{rest}");
         }
     }
     s.to_string()
@@ -217,5 +248,26 @@ mod tests {
         let partial: Config = serde_json::from_str(r#"{"jpeg_quality": 50}"#).unwrap();
         assert_eq!(partial.jpeg_quality, 50);
         assert!(partial.notifications);
+    }
+
+    #[test]
+    fn invalid_patterns_fall_back_instead_of_panicking() {
+        let t = chrono::Local::now();
+        for p in ["%Q", "shot_%", "", "   "] {
+            let n = file_stem(p, t);
+            assert!(n.starts_with("Screenshot_"), "{p:?} -> {n}");
+        }
+        assert_eq!(file_stem("a/b_%Y", t), format!("a_b_{}", t.format("%Y")));
+        assert!(format_pattern("%Q", t).is_none());
+    }
+
+    #[test]
+    fn home_is_expanded() {
+        let h = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        assert_eq!(shellexpand("~"), h);
+        assert_eq!(shellexpand("~/Pictures"), format!("{h}/Pictures"));
+        assert_eq!(shellexpand("$HOME/x"), format!("{h}/x"));
+        assert_eq!(shellexpand("~user/x"), "~user/x");
+        assert_eq!(shellexpand("/tmp"), "/tmp");
     }
 }

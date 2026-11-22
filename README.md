@@ -62,7 +62,10 @@ Editor keys: `S` select, `R` rect, `E` ellipse, `L` line, `A` arrow, `F` freehan
 linshot [region|window|active|full|last|open FILE...|settings|quit] [-d SECONDS] [-o FILE] [-c|-s|-e] [--tray]
 ```
 
-`-o FILE` saves straight to a file, `-c` copies to the clipboard, `-s` saves to the screenshots folder.
+`-o FILE` saves straight to a file: the command waits until the file is written and exits non-zero if
+the capture fails or is cancelled, so it works in scripts. `-c` copies to the clipboard, `-s` saves to
+the screenshots folder. On Wayland, copying without the editor open works best with `wl-clipboard`
+installed (desktops only accept clipboard data from a focused window).
 
 ## How capture works
 

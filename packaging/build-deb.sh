@@ -52,7 +52,7 @@ Maintainer: $MAINT
 Installed-Size: $SIZE
 Depends: $DEPS
 Recommends: xdg-desktop-portal, adwaita-icon-theme, librsvg2-common
-Suggests: grim, xdg-desktop-portal-gnome | xdg-desktop-portal-kde | xdg-desktop-portal-wlr
+Suggests: grim, wl-clipboard, xdg-desktop-portal-gnome | xdg-desktop-portal-kde | xdg-desktop-portal-wlr
 Section: graphics
 Priority: optional
 Homepage: https://github.com/adityatelange/linshot

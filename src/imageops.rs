@@ -72,6 +72,80 @@ pub fn copy_to_clipboard(s: &ImageSurface) {
     }
 }
 
+/// Copies to the clipboard from anywhere, including the background.
+///
+/// Wayland compositors only accept a new clipboard selection from a client
+/// that has had input, so when no Linshot window has focus (`full -c`, or
+/// "copy" as the after-capture action) the plain GTK call is silently
+/// dropped. Then this goes through `wl-copy` if installed, or else shows a
+/// small window just long enough to get focus and set the clipboard from it.
+pub async fn copy_anywhere(app: &gtk::Application, s: &ImageSurface) -> Result<(), String> {
+    let focused = app.windows().iter().any(|w| w.is_active());
+    if !crate::capture::is_wayland() || focused {
+        copy_to_clipboard(s);
+        return Ok(());
+    }
+    if glib::find_program_in_path("wl-copy").is_some() {
+        let png = encode(s, Path::new("x.png"), 100)?;
+        let r = gtk::gio::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = std::process::Command::new("wl-copy")
+                .args(["--type", "image/png"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            child.stdin.take().ok_or("no stdin")?.write_all(&png).map_err(|e| e.to_string())?;
+            // wl-copy forks a server and exits once it has read the image
+            match child.wait() {
+                Ok(st) if st.success() => Ok(()),
+                Ok(st) => Err(format!("wl-copy failed ({st})")),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await
+        .map_err(|_| "wl-copy thread panicked".to_string())?;
+        match r {
+            Ok(()) => return Ok(()),
+            Err(e) => eprintln!("linshot: {e}; trying a focused window"),
+        }
+    }
+    const NEED_WL_COPY: &str = "the desktop only accepts clipboard data from a focused window. Install wl-clipboard (wl-copy) to copy without opening the editor";
+    // wlroots also wants the serial of an input event, which a window that
+    // was merely focused never received: the selection would be rejected
+    if crate::session::is_wlroots() {
+        return Err(NEED_WL_COPY.into());
+    }
+    let win = gtk::Window::builder()
+        .application(app)
+        .title("Linshot")
+        .resizable(false)
+        .default_width(260)
+        .build();
+    let label = gtk::Label::new(Some("Copying screenshot\u{2026}"));
+    label.set_margin_top(18);
+    label.set_margin_bottom(18);
+    label.set_margin_start(24);
+    label.set_margin_end(24);
+    win.set_child(Some(&label));
+    win.present();
+    let start = std::time::Instant::now();
+    while !win.is_active() && start.elapsed() < std::time::Duration::from_millis(1500) {
+        glib::timeout_future(std::time::Duration::from_millis(30)).await;
+    }
+    let ok = win.is_active();
+    if ok {
+        // the clipboard stays owned by Linshot after the window is gone
+        copy_to_clipboard(s);
+        glib::timeout_future(std::time::Duration::from_millis(150)).await;
+    }
+    win.destroy();
+    if ok {
+        Ok(())
+    } else {
+        Err(NEED_WL_COPY.into())
+    }
+}
+
 pub fn save(s: &ImageSurface, path: &Path, jpeg_quality: u8) -> Result<(), String> {
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(d).map_err(|e| format!("cannot create folder {}: {e}", d.display()))?;

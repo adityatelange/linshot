@@ -23,6 +23,7 @@ use cairo::ImageSurface;
 use config::{AfterCapture, Config};
 use gtk::prelude::*;
 use gtk::{gio, glib};
+use std::collections::HashMap;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -61,6 +62,8 @@ pub struct Req {
     /// ms to wait before grabbing so a menu or popover that started the
     /// capture has closed; 0 for shortcuts and the command line
     pub settle: u32,
+    /// command-line request waiting for the result (see [`Done`]); 0: none
+    pub id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -78,10 +81,10 @@ pub enum Cmd {
 
 impl Cmd {
     pub fn cap(mode: Mode) -> Cmd {
-        Cmd::Capture(Req { mode, delay: 0, output: None, action: None, settle: 0 })
+        Cmd::Capture(Req { mode, delay: 0, output: None, action: None, settle: 0, id: 0 })
     }
     pub fn delayed(mode: Mode, delay: u32) -> Cmd {
-        Cmd::Capture(Req { mode, delay, output: None, action: None, settle: 0 })
+        Cmd::Capture(Req { mode, delay, output: None, action: None, settle: 0, id: 0 })
     }
     /// A capture started from a menu (tray, editor): wait for it to close.
     pub fn from_menu(self) -> Cmd {
@@ -202,7 +205,7 @@ fn parse(args: &[String], cwd: &Path) -> Result<Vec<Cmd>, String> {
     }
     let mut cmds: Vec<Cmd> = files.into_iter().map(Cmd::OpenFile).collect();
     if let Some(m) = mode {
-        cmds.push(Cmd::Capture(Req { mode: m, delay, output, action, settle: 0 }));
+        cmds.push(Cmd::Capture(Req { mode: m, delay, output, action, settle: 0, id: 0 }));
     }
     if let Some(o) = other {
         cmds.push(o);
@@ -235,19 +238,43 @@ fn main() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
     app.connect_startup(startup);
-    app.connect_command_line(|_, cl| {
+    app.connect_command_line(|app, cl| {
+        // keep the app up until the queued commands have started (a capture
+        // then holds it itself): without a daemon it would otherwise exit
+        // as soon as this handler returns. Idle runs after the command loop.
+        let hold = app.hold();
+        glib::idle_add_local_once(move || drop(hold));
         let args: Vec<String> = cl.arguments().iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
         let cwd = cl.cwd().unwrap_or_else(|| PathBuf::from("."));
         match parse(&args, &cwd) {
             Ok(cmds) => CTX.with(|c| {
                 let Some(ctx) = c.get() else { return 0 };
+                // without a session bus every invocation is its own process:
+                // only the launcher or --tray stays resident
+                if cmds.is_empty() || cmds.iter().any(|c| matches!(c, Cmd::Show)) {
+                    become_daemon(ctx);
+                }
                 let mut status = 0;
-                for cmd in cmds {
+                for mut cmd in cmds {
                     if matches!(cmd, Cmd::Capture(_)) && ctx.busy.get() {
                         // tell the caller (e.g. a script using -o) instead of failing silently
                         printerr(cl, "linshot: another capture is in progress, request ignored\n");
                         status = 1;
                         continue;
+                    }
+                    // tell a script about files the editor can't open (the dialog
+                    // in the running instance is all it got before)
+                    if let Cmd::OpenFile(p) = &cmd
+                        && gtk::gdk_pixbuf::Pixbuf::file_info(p).is_none()
+                    {
+                        printerr(cl, &format!("linshot: cannot open {}: missing or not an image\n", p.display()));
+                        status = 1;
+                    }
+                    // -o: the caller waits for the file and gets the real result
+                    if let Cmd::Capture(r) = &mut cmd
+                        && r.output.is_some()
+                    {
+                        r.id = Done::register(cl);
                     }
                     let _ = ctx.tx.send_blocking(cmd);
                 }
@@ -259,7 +286,119 @@ fn main() -> glib::ExitCode {
             }
         }
     });
-    app.run_with_args(&args)
+    let code = app.run_with_args(&args);
+    // a first instance quit while answering its own `-o` request
+    Done::abandon_all("Linshot was quit before the capture finished");
+    // the first instance answering its own `-o` request: its result
+    EXIT.with(|e| e.get()).map(glib::ExitCode::from).unwrap_or(code)
+}
+
+thread_local! {
+    static PENDING: RefCell<HashMap<u64, Pending>> = RefCell::new(HashMap::new());
+    static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static EXIT: Cell<Option<i32>> = const { Cell::new(None) };
+    static DAEMON: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The command line of a `-o` request. Holding it keeps the calling process
+/// waiting (GApplication replies when it is released).
+struct Pending {
+    cl: gio::ApplicationCommandLine,
+}
+
+/// The outcome of one capture request. Every path through a capture holds
+/// it, so dropping it — after saving, on cancel, on any error — answers a
+/// waiting command line exactly once. It also keeps the app alive while the
+/// capture runs, which matters when there is no daemon (no session bus, or
+/// the first instance handling a `-o` request).
+struct Done {
+    ctx: Rc<Ctx>,
+    id: u64,
+    result: RefCell<Result<(), String>>,
+    /// the error also went to this process's stderr (via `Ctx::error`)
+    reported: Cell<bool>,
+    _hold: gio::ApplicationHoldGuard,
+}
+
+impl Done {
+    fn new(ctx: &Rc<Ctx>, id: u64) -> Rc<Done> {
+        Rc::new(Done { ctx: ctx.clone(), id, result: RefCell::new(Err("cancelled".into())), reported: Cell::new(false), _hold: ctx.app.hold() })
+    }
+
+    fn register(cl: &gio::ApplicationCommandLine) -> u64 {
+        let id = NEXT_ID.with(|n| n.replace(n.get() + 1));
+        PENDING.with(|p| p.borrow_mut().insert(id, Pending { cl: cl.clone() }));
+        id
+    }
+
+    fn ok(&self) {
+        *self.result.borrow_mut() = Ok(());
+    }
+
+    fn fail(&self, msg: &str) {
+        *self.result.borrow_mut() = Err(msg.to_string());
+    }
+
+    /// Fails and shows `msg` the usual way (dialog + this process's stderr).
+    fn error(&self, msg: &str) {
+        self.fail(msg);
+        self.reported.set(true);
+        self.ctx.error(None, msg);
+    }
+
+    /// Answers every waiting command line with a failure (Linshot is
+    /// quitting, so their captures will never finish).
+    fn abandon_all(msg: &str) {
+        for (_, p) in PENDING.with(|p| p.borrow_mut().drain().collect::<Vec<_>>()) {
+            printerr(&p.cl, &format!("linshot: {msg}\n"));
+            p.cl.set_exit_status(1);
+            if !p.cl.is_remote() {
+                EXIT.with(|e| e.set(Some(1)));
+            }
+        }
+    }
+}
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        let Some(p) = PENDING.with(|p| p.borrow_mut().remove(&self.id)) else { return };
+        let code = match &*self.result.borrow() {
+            Ok(()) => 0,
+            Err(e) => {
+                // the first instance already printed it on its own stderr
+                if p.cl.is_remote() || !self.reported.get() {
+                    printerr(&p.cl, &format!("linshot: {e}\n"));
+                }
+                1
+            }
+        };
+        p.cl.set_exit_status(code);
+        if !p.cl.is_remote() {
+            // this process was started for the request: answer and exit
+            // instead of staying resident
+            EXIT.with(|e| e.set(Some(code)));
+            let app = self.ctx.app.clone();
+            glib::idle_add_local_once(move || {
+                if app.windows().iter().all(|w| !w.is_visible()) {
+                    app.quit();
+                }
+            });
+        }
+    }
+}
+
+/// Stays running in the background (tray, Print key, clipboard). With a
+/// session bus that is every first instance; without one only the launcher
+/// and `--tray`, since each invocation would otherwise be a new permanent
+/// process.
+fn become_daemon(ctx: &Rc<Ctx>) {
+    if DAEMON.with(|d| d.replace(true)) {
+        return;
+    }
+    if capture::is_x11() && ctx.cfg.borrow().hotkeys && !shortcuts::installed() {
+        hotkeys::spawn(ctx.tx.clone());
+    }
+    std::mem::forget(ctx.app.hold());
 }
 
 /// Linshot usually runs in the background (autostart, tray) where stderr is
@@ -352,10 +491,9 @@ fn startup(app: &gtk::Application) {
         });
     }
 
-    if capture::is_x11() && ctx.cfg.borrow().hotkeys && !shortcuts::installed() {
-        hotkeys::spawn(tx.clone());
+    if app.dbus_connection().is_some() {
+        become_daemon(&ctx);
     }
-    std::mem::forget(app.hold());
 
     restore_shortcuts(&ctx);
     {
@@ -530,7 +668,15 @@ fn handle(ctx: &Rc<Ctx>, cmd: Cmd) {
         }
         Cmd::Settings => settings::show(ctx),
         Cmd::Show => show_control(ctx),
-        Cmd::Quit => ctx.app.quit(),
+        Cmd::Quit => {
+            // answer `-o` callers still waiting, then let the replies go out
+            Done::abandon_all("Linshot was quit before the capture finished");
+            if let Some(c) = ctx.countdown.borrow().as_ref() {
+                c.set(true);
+            }
+            let app = ctx.app.clone();
+            glib::idle_add_local_once(move || app.quit());
+        }
         Cmd::CancelCapture => {
             if let Some(c) = ctx.countdown.borrow().as_ref() {
                 c.set(true);
@@ -567,8 +713,10 @@ impl Drop for Busy {
 }
 
 fn capture(ctx: &Rc<Ctx>, req: Req) {
+    let done = Done::new(ctx, req.id);
     let Some(busy) = Busy::acquire(ctx) else {
         eprintln!("linshot: a capture is already in progress, ignoring {:?}", req.mode);
+        done.fail("another capture is in progress");
         return;
     };
     let mut settle = req.settle;
@@ -612,7 +760,9 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
         std::thread::spawn(move || {
             // Wayland compositors with an IPC window list (Wayfire, Sway, Hyprland)
             let wl = if wayland { wm::windows() } else { None };
-            let interactive = want_picker && wl.is_none();
+            // xdg-desktop-portal-wlr ignores "interactive" and returns the whole
+            // screen: on wlroots use Linshot's own overlay to pick instead
+            let interactive = want_picker && wl.is_none() && !crate::session::is_wlroots();
             let mut active = if want_active { capture::x11_active_window().map(|r| Area::Px(r)) } else { None };
             // no interactive portal (e.g. wlroots): grab everything and let the user select
             let t = std::time::Instant::now();
@@ -635,7 +785,7 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             let _ = tx.send_blocking((g, wins, active, interactive));
         });
         let Ok((g, wins, active, interactive)) = rx.recv().await else {
-            ctx.error(None, "Screenshot failed: the capture thread stopped unexpectedly");
+            done.error("Screenshot failed: the capture thread stopped unexpectedly");
             return;
         };
         let t = std::time::Instant::now();
@@ -645,8 +795,10 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             })),
             Err(e) => {
                 drop(busy);
-                if !e.contains("cancelled") {
-                    ctx.error(None, &format!("Screenshot failed: {e}"));
+                if e.contains("cancelled") {
+                    done.fail(&e);
+                } else {
+                    done.error(&format!("Screenshot failed: {e}"));
                 }
                 return;
             }
@@ -662,21 +814,21 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
         match (mode, active, last) {
             (Mode::Full, ..) => {
                 drop(busy);
-                deliver(&ctx, Ok(img), &req, ptr_at(&ptr, 0, 0))
+                deliver(&ctx, Ok(img), &req, ptr_at(&ptr, 0, 0), done)
             }
             _ if interactive => {
                 drop(busy);
-                deliver(&ctx, Ok(img), &req, ptr_at(&ptr, 0, 0))
+                deliver(&ctx, Ok(img), &req, ptr_at(&ptr, 0, 0), done)
             }
             (Mode::Active, Some((x, y, w, h)), _) => {
                 drop(busy);
                 let (x2, y2) = ((x + w).min(img.width()), (y + h).min(img.height()));
                 let (x, y) = (x.clamp(0, img.width() - 1), y.clamp(0, img.height() - 1));
-                deliver(&ctx, imageops::crop(&img, x, y, (x2 - x).max(1), (y2 - y).max(1)), &req, ptr_at(&ptr, x, y))
+                deliver(&ctx, imageops::crop(&img, x, y, (x2 - x).max(1), (y2 - y).max(1)), &req, ptr_at(&ptr, x, y), done)
             }
             (Mode::Last, _, Some(r)) => {
                 drop(busy);
-                deliver(&ctx, imageops::crop(&img, r[0], r[1], r[2], r[3]), &req, ptr_at(&ptr, r[0], r[1]))
+                deliver(&ctx, imageops::crop(&img, r[0], r[1], r[2], r[3]), &req, ptr_at(&ptr, r[0], r[1]), done)
             }
             _ => {
                 let ctx2 = ctx.clone();
@@ -696,7 +848,7 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
                                 c.last_region = Some([x, y, w, h]);
                                 c.save();
                             }
-                            deliver(&ctx2, imageops::crop(&full, x, y, w, h), &req, ptr_at(&ptr, x, y))
+                            deliver(&ctx2, imageops::crop(&full, x, y, w, h), &req, ptr_at(&ptr, x, y), done)
                         }
                     }),
                 );
@@ -742,11 +894,12 @@ fn ptr_at(p: &Ptr, x: i32, y: i32) -> Option<(ImageSurface, f64, f64)> {
     p.as_ref().map(|(s, px, py)| (s.clone(), (px - x) as f64, (py - y) as f64))
 }
 
-fn deliver(ctx: &Rc<Ctx>, img: Result<ImageSurface, String>, req: &Req, ptr: Option<(ImageSurface, f64, f64)>) {
+fn deliver(ctx: &Rc<Ctx>, img: Result<ImageSurface, String>, req: &Req, ptr: Option<(ImageSurface, f64, f64)>, done: Rc<Done>) {
     let img = match img {
         Ok(i) => i,
-        Err(e) => return ctx.error(None, &format!("Screenshot failed: {e}")),
+        Err(e) => return done.error(&format!("Screenshot failed: {e}")),
     };
+    done.ok();
     // keep the pointer only if it is inside the captured area
     let ptr = ptr.filter(|(s, x, y)| {
         *x + (s.width() as f64) > 0.0 && *y + (s.height() as f64) > 0.0 && *x < img.width() as f64 && *y < img.height() as f64
@@ -775,18 +928,25 @@ fn deliver(ctx: &Rc<Ctx>, img: Result<ImageSurface, String>, req: &Req, ptr: Opt
             true
         }
         Err(e) => {
-            ctx.error(None, &format!("Could not save {}: {e}", path.display()));
+            done.error(&format!("Could not save {}: {e}", path.display()));
             false
         }
     };
-    let copy = || {
-        imageops::copy_to_clipboard(&img);
-        ctx.notify("Screenshot copied", "The screenshot is on the clipboard.", None);
+    // `notify`: say "copied" (not when a "saved" notification covers it)
+    let copy = |notify: bool| {
+        let (ctx, img, done) = (ctx.clone(), img.clone(), done.clone());
+        glib::spawn_future_local(async move {
+            match imageops::copy_anywhere(&ctx.app, &img).await {
+                Ok(()) if notify => ctx.notify("Screenshot copied", "The screenshot is on the clipboard.", None),
+                Ok(()) => {}
+                Err(e) => done.error(&format!("Could not copy the screenshot: {e}.")),
+            }
+        });
     };
     if let Some(out) = &req.output {
         save(out.clone());
         if req.action == Some(AfterCapture::Clipboard) {
-            copy();
+            copy(true);
         }
         return;
     }
@@ -795,10 +955,10 @@ fn deliver(ctx: &Rc<Ctx>, img: Result<ImageSurface, String>, req: &Req, ptr: Opt
         AfterCapture::Save => {
             save(ctx.cfg.borrow().next_output_path());
         }
-        AfterCapture::Clipboard => copy(),
+        AfterCapture::Clipboard => copy(true),
         AfterCapture::SaveAndClipboard => {
             save(ctx.cfg.borrow().next_output_path());
-            imageops::copy_to_clipboard(&img);
+            copy(false);
         }
     }
 }

@@ -6,6 +6,9 @@
 use crate::{Cmd, Mode};
 use ksni::menu::{StandardItem, SubMenu};
 use ksni::MenuItem;
+use gtk::glib;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 pub struct Tray {
     tx: async_channel::Sender<Cmd>,
@@ -133,7 +136,8 @@ impl ksni::Tray for Tray {
 /// have none, so the launcher window is then the way back into Linshot.
 pub fn host_available() -> bool {
     let check = || -> zbus::Result<bool> {
-        let conn = zbus::blocking::Connection::session()?;
+        // called on the GTK thread: a frozen panel must not hang the app
+        let conn = zbus::blocking::connection::Builder::session()?.method_timeout(std::time::Duration::from_millis(300)).build()?;
         let p = zbus::blocking::Proxy::new(&conn, "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher")?;
         p.get_property("IsStatusNotifierHostRegistered")
     };
@@ -145,24 +149,40 @@ pub fn panel_always_dark() -> bool {
     crate::session::desktop_is("gnome")
 }
 
-/// The running tray icon (none if it could not be started).
+/// The tray icon. The service starts on its own thread, so the handle may
+/// arrive later (or never: no session bus); until then the state is kept
+/// here and applied when it does.
 pub struct TrayHandle {
-    handle: Option<ksni::blocking::Handle<Tray>>,
+    handle: Rc<RefCell<Option<ksni::blocking::Handle<Tray>>>>,
+    dark_panel: Rc<Cell<bool>>,
+    countdown: Rc<Cell<Option<u32>>>,
 }
 
 impl TrayHandle {
-    pub fn set_dark_panel(&self, dark: bool) {
-        if let Some(h) = &self.handle {
+    fn none() -> TrayHandle {
+        TrayHandle { handle: Rc::default(), dark_panel: Rc::new(Cell::new(true)), countdown: Rc::default() }
+    }
+
+    fn push(&self) {
+        if let Some(h) = self.handle.borrow().as_ref() {
+            let (dark, n) = (self.dark_panel.get(), self.countdown.get());
             // None once the service has stopped: nothing to update then
-            h.update(|t| t.dark_panel = dark);
+            h.update(|t| {
+                t.dark_panel = dark;
+                t.countdown = n;
+            });
         }
+    }
+
+    pub fn set_dark_panel(&self, dark: bool) {
+        self.dark_panel.set(dark);
+        self.push();
     }
 
     /// Shows the seconds left of a delayed capture on the icon (None: normal icon).
     pub fn set_countdown(&self, n: Option<u32>) {
-        if let Some(h) = &self.handle {
-            h.update(|t| t.countdown = n);
-        }
+        self.countdown.set(n);
+        self.push();
     }
 }
 
@@ -170,17 +190,31 @@ impl TrayHandle {
 /// across panel / StatusNotifierWatcher restarts and waits for a watcher that
 /// is not there yet; if the service cannot start at all (no session bus),
 /// Linshot carries on without a tray icon.
+///
+/// Starting it talks to the StatusNotifierWatcher, which may be slow or hung
+/// (a frozen panel): that happens off the GTK thread so startup, shortcuts
+/// and captures never wait for it.
 pub fn spawn(tx: async_channel::Sender<Cmd>) -> TrayHandle {
-    use ksni::blocking::TrayMethods;
-    let tray = Tray { tx, dark_panel: true, countdown: None };
-    let handle = match tray.assume_sni_available(true).spawn() {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!("linshot: could not start the tray icon: {e}");
-            None
+    let th = TrayHandle::none();
+    let (htx, hrx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        use ksni::blocking::TrayMethods;
+        let tray = Tray { tx, dark_panel: true, countdown: None };
+        match tray.assume_sni_available(true).spawn() {
+            Ok(h) => {
+                let _ = htx.send_blocking(h);
+            }
+            Err(e) => eprintln!("linshot: could not start the tray icon: {e}"),
         }
-    };
-    TrayHandle { handle }
+    });
+    let (handle, dark, n) = (th.handle.clone(), th.dark_panel.clone(), th.countdown.clone());
+    glib::spawn_future_local(async move {
+        if let Ok(h) = hrx.recv().await {
+            *handle.borrow_mut() = Some(h);
+            TrayHandle { handle, dark_panel: dark, countdown: n }.push();
+        }
+    });
+    th
 }
 
 #[cfg(test)]
@@ -189,8 +223,8 @@ mod tests {
 
     #[test]
     fn missing_tray_is_a_no_op() {
-        TrayHandle { handle: None }.set_dark_panel(false);
-        TrayHandle { handle: None }.set_countdown(Some(3));
+        TrayHandle::none().set_dark_panel(false);
+        TrayHandle::none().set_countdown(Some(3));
     }
 
     #[test]

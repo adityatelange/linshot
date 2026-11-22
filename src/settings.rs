@@ -251,10 +251,16 @@ pub fn show(ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         let win2 = win.clone();
         save.connect_clicked(move |_| {
+            let pat = pattern.text();
+            if config::format_pattern(&pat, chrono::Local::now()).is_none_or(|n| n.trim().is_empty()) {
+                ctx.error(Some(&win2), &format!("\u{201c}{pat}\u{201d} is not a valid file name pattern. Use strftime codes such as %Y-%m-%d_%H-%M-%S."));
+                pattern.grab_focus();
+                return;
+            }
             {
                 let mut c = ctx.cfg.borrow_mut();
                 c.output_dir = dir.text().to_string();
-                c.filename_pattern = pattern.text().to_string();
+                c.filename_pattern = pat.to_string();
                 c.format = if format.selected() == 1 { "jpg".into() } else { "png".into() };
                 c.jpeg_quality = quality.value() as u8;
                 c.after_capture = ACTIONS[(after.selected() as usize).min(3)].0;

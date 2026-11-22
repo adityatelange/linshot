@@ -105,7 +105,18 @@ pub enum Kind {
     Unknown,
 }
 
-fn classify(env: Env) -> Kind {
+/// Whether the compositor socket named by WAYLAND_DISPLAY (default
+/// wayland-0) exists: a stale WAYLAND_DISPLAY from an earlier login, or a
+/// Wayland session type inherited by a VNC/X session, points at nothing.
+fn wayland_alive(env: Env) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let name = env("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into());
+    let path = if name.starts_with('/') { Some(PathBuf::from(&name)) } else { runtime_dir(env).map(|r| r.join(&name)) };
+    path.and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.file_type().is_socket())
+}
+
+/// `wayland_alive`: the Wayland socket exists (see [`wayland_alive`]).
+fn classify(env: Env, wayland_alive: bool) -> Kind {
     let ty = env("XDG_SESSION_TYPE").map(|t| t.to_ascii_lowercase());
     // an X11 session that inherited a WAYLAND_DISPLAY (WSLg, a nested or
     // remote X session started from Wayland) is still X11
@@ -115,9 +126,12 @@ fn classify(env: Env) -> Kind {
     let wayland_session = ty.as_deref() == Some("wayland");
     // a Wayland session counts as Wayland even when GTK runs through XWayland
     // (GDK_BACKEND=x11): the X root there only shows X clients
-    if env("WAYLAND_DISPLAY").is_some() || wayland_session {
+    let says_wayland = env("WAYLAND_DISPLAY").is_some() || wayland_session;
+    if says_wayland && (wayland_alive || env("DISPLAY").is_none()) {
         Kind::Wayland
     } else if env("DISPLAY").is_some() {
+        // includes Wayland variables with no compositor behind them: GTK
+        // ends up on X11 too, and only the X11 grab can work
         Kind::X11
     } else {
         Kind::Unknown
@@ -126,7 +140,7 @@ fn classify(env: Env) -> Kind {
 
 pub fn kind() -> Kind {
     static K: OnceLock<Kind> = OnceLock::new();
-    *K.get_or_init(|| classify(&real_env))
+    *K.get_or_init(|| classify(&real_env, wayland_alive(&real_env)))
 }
 
 /// Lower-case desktop identifiers, e.g. "ubuntu:gnome", "kde", "sway".
@@ -196,16 +210,21 @@ mod tests {
 
     #[test]
     fn session_kind() {
-        assert_eq!(classify(&env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")])), Kind::Wayland);
-        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")])), Kind::X11);
-        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "x11"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")])), Kind::X11);
+        assert_eq!(classify(&env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")]), true), Kind::Wayland);
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")]), true), Kind::X11);
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "x11"), ("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")]), true), Kind::X11);
         // started from a systemd unit or ssh: no session type
-        assert_eq!(classify(&env(&[("DISPLAY", ":1")])), Kind::X11);
-        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "tty"), ("DISPLAY", ":0")])), Kind::X11);
+        assert_eq!(classify(&env(&[("DISPLAY", ":1")]), true), Kind::X11);
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "tty"), ("DISPLAY", ":0")]), true), Kind::X11);
         // XWayland-only environment on a Wayland session
-        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "wayland"), ("DISPLAY", ":0")])), Kind::Wayland);
-        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "wayland")])), Kind::Wayland);
-        assert_eq!(classify(&env(&[])), Kind::Unknown);
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "wayland"), ("DISPLAY", ":0")]), true), Kind::Wayland);
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "wayland")]), true), Kind::Wayland);
+        assert_eq!(classify(&env(&[]), true), Kind::Unknown);
+        // Wayland variables but no compositor socket (VNC/x2go from a Wayland
+        // login, stale WAYLAND_DISPLAY in a systemd unit): X11 if there is one
+        assert_eq!(classify(&env(&[("XDG_SESSION_TYPE", "wayland"), ("DISPLAY", ":1")]), false), Kind::X11);
+        assert_eq!(classify(&env(&[("WAYLAND_DISPLAY", "wayland-9"), ("DISPLAY", ":0")]), false), Kind::X11);
+        assert_eq!(classify(&env(&[("WAYLAND_DISPLAY", "wayland-9")]), false), Kind::Wayland);
     }
 
     #[test]
@@ -234,5 +253,22 @@ mod tests {
         // nothing at all but one X server
         assert_eq!(missing_display_vars(&env(&[]), &[], &s(&[":0"]), run), vec![("DISPLAY", ":0".to_string())]);
         assert!(missing_display_vars(&env(&[("WAYLAND_DISPLAY", "w")]), &s(&["wayland-0"]), &[], run).is_empty());
+    }
+
+    #[test]
+    fn wayland_socket_check() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("ls-wl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _l = UnixListener::bind(dir.join("wayland-5")).unwrap();
+        std::fs::write(dir.join("wayland-6"), b"").unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        assert!(wayland_alive(&env(&[("XDG_RUNTIME_DIR", &d), ("WAYLAND_DISPLAY", "wayland-5")])));
+        // a plain file or nothing at all is not a compositor
+        assert!(!wayland_alive(&env(&[("XDG_RUNTIME_DIR", &d), ("WAYLAND_DISPLAY", "wayland-6")])));
+        assert!(!wayland_alive(&env(&[("XDG_RUNTIME_DIR", &d), ("WAYLAND_DISPLAY", "wayland-7")])));
+        let abs = dir.join("wayland-5").to_string_lossy().into_owned();
+        assert!(wayland_alive(&env(&[("WAYLAND_DISPLAY", &abs)])));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
