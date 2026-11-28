@@ -816,12 +816,19 @@ fn confirm_bar(cr: &cairo::Context, sel: &R, s: &State, g: R) {
         }
         rounded(cr, b.x, b.y, b.w, b.h, 6.0);
         cr.fill().ok();
-        // icon, then text
+        // icon and text, centred together in the button
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.set_line_width(2.0);
         cr.set_line_cap(cairo::LineCap::Round);
         cr.set_line_join(cairo::LineJoin::Round);
-        let (ix, iy) = (b.x + 14.0, b.y + b.h / 2.0);
+        let text = if i == 1 { "Capture" } else { "Cancel" };
+        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        cr.set_font_size(13.0);
+        let tw = cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(48.0);
+        const ICON: f64 = 11.0;
+        const ICON_GAP: f64 = 8.0;
+        let start = b.x + (b.w - (ICON + ICON_GAP + tw)) / 2.0;
+        let (ix, iy) = (start + ICON / 2.0, b.y + b.h / 2.0);
         if i == 1 {
             cr.move_to(ix - 5.0, iy + 0.5);
             cr.line_to(ix - 1.5, iy + 4.0);
@@ -833,10 +840,8 @@ fn confirm_bar(cr: &cairo::Context, sel: &R, s: &State, g: R) {
             cr.line_to(ix - 4.0, iy + 4.0);
         }
         cr.stroke().ok();
-        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-        cr.set_font_size(13.0);
-        cr.move_to(b.x + 28.0, b.y + b.h / 2.0 + 4.5);
-        cr.show_text(if i == 1 { "Capture" } else { "Cancel" }).ok();
+        cr.move_to(start + ICON + ICON_GAP, centered_baseline(cr, b.y + b.h / 2.0));
+        cr.show_text(text).ok();
     }
 }
 
@@ -881,6 +886,14 @@ pub fn warm_up(app: &gtk::Application) {
     crate::trace("warm up", t);
 }
 
+/// The baseline that centres a line of text vertically on `center_y` for the
+/// font currently set (font metrics differ between machines, so a fixed
+/// offset only looks right on one of them).
+fn centered_baseline(cr: &cairo::Context, center_y: f64) -> f64 {
+    let (ascent, descent) = cr.font_extents().map(|f| (f.ascent(), f.descent())).unwrap_or((11.0, 3.0));
+    center_y + (ascent - descent) / 2.0
+}
+
 fn label_width(cr: &cairo::Context, text: &str) -> f64 {
     cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
     cr.set_font_size(13.0);
@@ -894,7 +907,7 @@ fn label(cr: &cairo::Context, text: &str, x: f64, y: f64, maxw: f64) {
     rounded(cr, x, y, bw, 24.0, 5.0);
     cr.fill().ok();
     cr.set_source_rgb(1.0, 1.0, 1.0);
-    cr.move_to(x + 8.0, y + 16.5);
+    cr.move_to(x + 8.0, centered_baseline(cr, y + 12.0));
     cr.show_text(text).ok();
 }
 
