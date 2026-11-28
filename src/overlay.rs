@@ -199,6 +199,20 @@ fn press_hit(a: &Adjust, bounds: &R, p: (f64, f64)) -> Hit {
     }
 }
 
+/// How far an arrow key nudges the selection, in logical px: one image pixel
+/// (ten with Shift), so it is exact on HiDPI screens too.
+fn nudge_delta(key: gdk::Key, shift: bool, (sx, sy): (f64, f64)) -> Option<(f64, f64)> {
+    let n = if shift { 10.0 } else { 1.0 };
+    let (dx, dy) = match key {
+        gdk::Key::Left | gdk::Key::KP_Left => (-1.0, 0.0),
+        gdk::Key::Right | gdk::Key::KP_Right => (1.0, 0.0),
+        gdk::Key::Up | gdk::Key::KP_Up => (0.0, -1.0),
+        gdk::Key::Down | gdk::Key::KP_Down => (0.0, 1.0),
+        _ => return None,
+    };
+    Some((dx * n / sx, dy * n / sy))
+}
+
 /// The selection being adjusted after a drag.
 struct Adjust {
     sel: R,
@@ -591,9 +605,20 @@ pub fn select(
             let st = st.clone();
             let finish = finish.clone();
             let redraw = redraw.clone();
-            keys.connect_key_pressed(move |_, key, _, _| {
+            keys.connect_key_pressed(move |_, key, _, state| {
                 match key {
                     gdk::Key::Escape => finish(None),
+                    // arrows nudge the selection by one pixel (Shift: ten)
+                    k if st.borrow().adjust.is_some() && nudge_delta(k, false, (1.0, 1.0)).is_some() => {
+                        let mut s = st.borrow_mut();
+                        let scale = (s.sx, s.sy);
+                        let bounds = s.virt;
+                        if let (Some(d), Some(a)) = (nudge_delta(k, state.contains(gdk::ModifierType::SHIFT_MASK), scale), s.adjust.as_mut()) {
+                            a.sel = moved(&a.sel, d, &bounds);
+                        }
+                        drop(s);
+                        redraw();
+                    }
                     // the selection is made: nothing to switch
                     gdk::Key::space if st.borrow().adjust.is_some() => return glib::Propagation::Proceed,
                     gdk::Key::space => {
@@ -732,7 +757,7 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
     // help text: bottom left, moved to the top when it would cover the
     // selection or the pointer
     let help = if s.adjust.is_some() {
-        "Drag the edges to adjust · drag inside to move · Enter: capture · Esc: cancel"
+        "Drag to adjust · arrow keys nudge (Shift: 10 px) · Enter: capture · Esc: cancel"
     } else if s.picking_windows() {
         "Window mode · click a window · Space: region mode · Esc: cancel"
     } else if s.windows.is_empty() {
@@ -981,6 +1006,18 @@ mod tests {
         let a = Adjust { sel: SEL, grab: None, last_press: None, double: false };
         assert_eq!(press_hit(&a, &BOUNDS, mid(&capture)), Hit::Bar(1));
         assert_eq!(press_hit(&a, &BOUNDS, (200.0, 150.0)), Hit::Move);
+    }
+
+    #[test]
+    fn arrow_keys_nudge_by_image_pixels() {
+        assert_eq!(nudge_delta(gdk::Key::Left, false, (1.0, 1.0)), Some((-1.0, 0.0)));
+        assert_eq!(nudge_delta(gdk::Key::Down, true, (1.0, 1.0)), Some((0.0, 10.0)));
+        // 2x HiDPI: an image pixel is half a logical pixel
+        assert_eq!(nudge_delta(gdk::Key::Right, false, (2.0, 2.0)), Some((0.5, 0.0)));
+        assert_eq!(nudge_delta(gdk::Key::a, false, (1.0, 1.0)), None);
+        // and nudging keeps the selection on screen
+        let r = moved(&SEL, nudge_delta(gdk::Key::Up, true, (1.0, 1.0)).unwrap(), &R { x: 0.0, y: 95.0, w: 1000.0, h: 800.0 });
+        assert_eq!(r.y, 95.0);
     }
 
     #[test]
