@@ -32,13 +32,13 @@ Website: https://adityatelange.github.io/linshot/
 Debian, Ubuntu, Linux Mint and derivatives:
 
 ```bash
-sudo apt install ./linshot_0.3.0_amd64.deb
+sudo apt install ./linshot_0.4.0_amd64.deb
 ```
 
 Fedora, openSUSE and other RPM-based distributions:
 
 ```bash
-sudo dnf install ./linshot-0.3.0-1.x86_64.rpm      # openSUSE: sudo zypper install ./linshot-0.3.0-1.x86_64.rpm
+sudo dnf install ./linshot-0.4.0-1.x86_64.rpm      # openSUSE: sudo zypper install ./linshot-0.4.0-1.x86_64.rpm
 ```
 
 Packages for amd64 / x86_64 and arm64 / aarch64 are on the
