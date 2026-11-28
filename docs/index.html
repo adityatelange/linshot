@@ -98,6 +98,7 @@ h2 { font-size: clamp(24px, 3.4vw, 32px); letter-spacing: -.01em; margin: 0 0 8p
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
 .card h3 { margin: 0 0 6px; font-size: 17px; }
 .card p { margin: 0; color: var(--muted); font-size: 15px; }
+.card pre { margin: 14px 0 0; }
 
 .gallery { display: grid; gap: 20px; grid-template-columns: 1fr; align-items: start; }
 @media (min-width: 760px) {
@@ -139,7 +140,7 @@ footer { padding: 56px 0 40px; color: var(--muted); font-size: 14px; text-align:
       <h1>Screenshots on Linux,<br><span>captured and annotated.</span></h1>
       <p>Linshot is a free, open-source screenshot tool for X11 and Wayland. Pick a region or window, then add arrows, text, highlights, blur and numbered steps before you save or copy.</p>
       <div class="cta">
-        <a class="btn primary" href="https://github.com/adityatelange/linshot/releases/latest">Download .deb / .rpm</a>
+        <a class="btn primary" href="https://github.com/adityatelange/linshot/releases/latest">Download for Linux</a>
         <a class="btn ghost" href="https://github.com/adityatelange/linshot">View source</a>
       </div>
       <div class="chips">
@@ -178,10 +179,13 @@ footer { padding: 56px 0 40px; color: var(--muted); font-size: 14px; text-align:
 
     <section id="install" aria-labelledby="install-h">
       <h2 id="install-h">Install</h2>
-      <p class="lead">Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS and other derivatives, and Fedora 36+ and openSUSE (amd64 and arm64).</p>
-      <pre><code>sudo apt install ./linshot_0.3.0_amd64.deb</code></pre>
-      <pre><code>sudo dnf install ./linshot-0.3.0-1.x86_64.rpm</code></pre>
-      <p>Download the package from the <a href="https://github.com/adityatelange/linshot/releases/latest">latest release</a>. Other distributions can <a href="https://github.com/adityatelange/linshot#build">build from source</a> (Rust and GTK 4.6+).</p>
+      <p class="lead">Download the package for your distribution from the <a href="https://github.com/adityatelange/linshot/releases/latest">latest release</a> (amd64 / x86_64 and arm64 / aarch64), then install it.</p>
+      <div class="grid">
+        <div class="card"><h3>Debian, Ubuntu, Mint</h3><p>Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS and other derivatives.</p><pre><code>sudo apt install ./linshot_*.deb</code></pre></div>
+        <div class="card"><h3>Fedora, openSUSE</h3><p>Fedora 36+, openSUSE and other RPM-based distributions.</p><pre><code>sudo dnf install ./linshot-*.rpm
+# openSUSE: sudo zypper install ./linshot-*.rpm</code></pre></div>
+      </div>
+      <p class="lead" style="margin:16px 0 0">Anything else can <a href="https://github.com/adityatelange/linshot#build">build from source</a> (Rust and GTK 4.6+).</p>
     </section>
 
     <section id="shortcuts" aria-labelledby="shortcuts-h">
