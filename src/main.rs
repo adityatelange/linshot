@@ -844,8 +844,11 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
                     mode == Mode::Window,
                     mag,
                     adjust,
-                    Box::new(move |r| {
+                    Box::new(move |r, copy| {
                         drop(busy);
+                        // Ctrl+C: put it on the clipboard instead of the usual action
+                        // (with -o the file is still written)
+                        let req = if copy { Req { action: Some(AfterCapture::Clipboard), ..req } } else { req };
                         if let Some((x, y, w, h)) = r {
                             {
                                 let mut c = ctx2.cfg.borrow_mut();

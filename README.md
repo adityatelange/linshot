@@ -18,7 +18,8 @@ Website: https://adityatelange.github.io/linshot/
   click a window to snap to it (X11), Space toggles window mode, Esc / right-click cancels.
   After dragging, adjust the selection: drag an edge or corner to resize, drag inside to move,
   then press Enter, double-click, or use the Capture / Cancel buttons (Preferences → "Adjust
-  selection before capturing"; turn it off to capture as soon as you let go)
+  selection before capturing"; turn it off to capture as soon as you let go). Arrow keys nudge the
+  selection (Shift: 10 px); Ctrl+C copies it to the clipboard without opening the editor
 - **Editor:** rectangle, ellipse, line, arrow, freehand, text, highlighter, pixelate, blur,
   numbered step counters, crop; select/move/delete, per-shape colour/fill/width/font/shadow,
   undo/redo, zoom

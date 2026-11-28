@@ -243,6 +243,8 @@ struct State {
     adjust: Option<Adjust>,
     /// the current drag began outside an adjustable selection
     restart: bool,
+    /// Ctrl+C: copy the area to the clipboard and skip the editor
+    copy_only: bool,
     cursor_name: &'static str,
     done: bool,
 }
@@ -289,7 +291,9 @@ impl State {
     }
 }
 
-pub type Done = Box<dyn FnOnce(Option<(i32, i32, i32, i32)>)>;
+/// Called once with the chosen area in image pixels (None: cancelled) and
+/// whether to only copy it to the clipboard (Ctrl+C) instead of the usual action.
+pub type Done = Box<dyn FnOnce(Option<(i32, i32, i32, i32)>, bool)>;
 
 /// Shows the selector. `windows` are window rectangles in image pixels.
 pub fn select(
@@ -331,6 +335,7 @@ pub fn select(
         adjustable: adjust,
         adjust: None,
         restart: false,
+        copy_only: false,
         cursor_name: "crosshair",
         done: false,
     }));
@@ -369,13 +374,13 @@ pub fn select(
         let done = done.clone();
         let watch = watch.clone();
         Rc::new(move |result: Option<R>| {
-            let px = {
+            let (px, copy) = {
                 let mut s = st.borrow_mut();
                 if s.done {
                     return;
                 }
                 s.done = true;
-                result.map(|r| s.to_px(&r)).filter(|r| r.2 > 0 && r.3 > 0)
+                (result.map(|r| s.to_px(&r)).filter(|r| r.2 > 0 && r.3 > 0), s.copy_only)
             };
             let to_close = wins.borrow().clone();
             for w in to_close {
@@ -386,7 +391,7 @@ pub fn select(
             // let the compositor remove the overlay before anything else happens
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 if let Some(f) = done.borrow_mut().take() {
-                    f(px);
+                    f(px, copy);
                 }
                 // the widgets' handlers hold these lists: clearing them breaks the
                 // reference cycle so the windows and the screenshot are freed
@@ -402,7 +407,7 @@ pub fn select(
     if mons.is_empty() {
         let full = st.borrow().to_px(&virt);
         if let Some(f) = done.borrow_mut().take() {
-            f(Some(full));
+            f(Some(full), false);
         }
         return;
     }
@@ -633,6 +638,14 @@ pub fn select(
                             finish(a);
                         }
                     }
+                    // copy what is highlighted, no editor
+                    gdk::Key::c | gdk::Key::C if state.contains(gdk::ModifierType::CONTROL_MASK) => {
+                        let a = st.borrow().active();
+                        if a.is_some() {
+                            st.borrow_mut().copy_only = true;
+                            finish(a);
+                        }
+                    }
                     _ => return glib::Propagation::Proceed,
                 }
                 glib::Propagation::Stop
@@ -757,7 +770,7 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
     // help text: bottom left, moved to the top when it would cover the
     // selection or the pointer
     let help = if s.adjust.is_some() {
-        "Drag to adjust · arrow keys nudge (Shift: 10 px) · Enter: capture · Esc: cancel"
+        "Drag to adjust · arrows nudge (Shift: 10 px) · Enter: capture · Ctrl+C: copy · Esc: cancel"
     } else if s.picking_windows() {
         "Window mode · click a window · Space: region mode · Esc: cancel"
     } else if s.windows.is_empty() {
