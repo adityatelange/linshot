@@ -107,6 +107,11 @@ pub fn show(ctx: &Rc<Ctx>) {
     let g = Group::new("Capture");
     let (cur, _) = g.switch("Capture mouse pointer", Some("It can still be moved or removed in the editor"), cfg.capture_cursor);
     let (mag, _) = g.switch("Magnifier while selecting", Some("Zoomed view and colour under the pointer"), cfg.magnifier);
+    let (adj, _) = g.switch(
+        "Adjust selection before capturing",
+        Some("After dragging, resize or move the area, then confirm. Off: capture as soon as you let go"),
+        cfg.adjust_selection,
+    );
     page.append(&g.root);
 
     // ------------------------------------------------------------ after capture
@@ -266,6 +271,7 @@ pub fn show(ctx: &Rc<Ctx>) {
                 c.after_capture = ACTIONS[(after.selected() as usize).min(3)].0;
                 c.notifications = notif.is_active();
                 c.magnifier = mag.is_active();
+                c.adjust_selection = adj.is_active();
                 c.capture_cursor = cur.is_active();
                 c.hotkeys = hot.is_active();
                 c.theme = THEMES[(theme.selected() as usize).min(2)].0.into();

@@ -833,13 +833,17 @@ fn capture(ctx: &Rc<Ctx>, req: Req) {
             _ => {
                 let ctx2 = ctx.clone();
                 let full = img.clone();
-                let mag = ctx.cfg.borrow().magnifier;
+                let (mag, adjust) = {
+                    let c = ctx.cfg.borrow();
+                    (c.magnifier, c.adjust_selection)
+                };
                 overlay::select(
                     &ctx.app,
                     img,
                     wins,
                     mode == Mode::Window,
                     mag,
+                    adjust,
                     Box::new(move |r| {
                         drop(busy);
                         if let Some((x, y, w, h)) = r {

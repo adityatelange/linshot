@@ -55,6 +55,160 @@ pub fn monitors() -> Vec<(gdk::Monitor, R)> {
     out
 }
 
+/// Edge bits of a resize.
+const LEFT: u8 = 1;
+const TOP: u8 = 2;
+const RIGHT: u8 = 4;
+const BOTTOM: u8 = 8;
+/// How close (logical px) to an edge a press grabs it.
+const HANDLE: f64 = 9.0;
+/// The smallest selection adjusting can leave (so Enter always captures something).
+const MIN_SEL: f64 = 4.0;
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hit {
+    /// outside the selection: starts a new one
+    New,
+    Move,
+    Resize(u8),
+    /// a button of the confirm bar: 0 cancel, 1 capture, 2 the bar itself
+    Bar(u8),
+}
+
+/// What a press at `p` does to the selection `r`: grab an edge or corner
+/// (also from just outside it), move it from inside, or start over.
+fn hit_test(r: &R, p: (f64, f64)) -> Hit {
+    // small selections keep an interior to move them by
+    let t = HANDLE.min(r.w.min(r.h) / 3.0).max(3.0);
+    let near = |v: f64, edge: f64| (v - edge).abs() <= t;
+    if !(p.0 >= r.x - t && p.0 <= r.x + r.w + t && p.1 >= r.y - t && p.1 <= r.y + r.h + t) {
+        return Hit::New;
+    }
+    let mut e = 0;
+    if near(p.0, r.x) {
+        e |= LEFT;
+    } else if near(p.0, r.x + r.w) {
+        e |= RIGHT;
+    }
+    if near(p.1, r.y) {
+        e |= TOP;
+    } else if near(p.1, r.y + r.h) {
+        e |= BOTTOM;
+    }
+    if e != 0 {
+        Hit::Resize(e)
+    } else if r.contains(p) {
+        Hit::Move
+    } else {
+        Hit::New
+    }
+}
+
+fn cursor_for(h: Hit) -> &'static str {
+    match h {
+        Hit::New => "crosshair",
+        Hit::Move => "move",
+        Hit::Bar(_) => "pointer",
+        Hit::Resize(e) => match (e & (LEFT | RIGHT), e & (TOP | BOTTOM)) {
+            (0, _) => "ns-resize",
+            (_, 0) => "ew-resize",
+            (x, y) if (x == LEFT) == (y == TOP) => "nwse-resize",
+            _ => "nesw-resize",
+        },
+    }
+}
+
+/// `orig` with the given edges moved by `d`, inside `bounds`. Dragging an
+/// edge past the opposite one flips the rectangle.
+fn resized(orig: &R, edges: u8, d: (f64, f64), bounds: &R) -> R {
+    let (mut x0, mut y0, mut x1, mut y1) = (orig.x, orig.y, orig.x + orig.w, orig.y + orig.h);
+    if edges & LEFT != 0 {
+        x0 += d.0;
+    }
+    if edges & RIGHT != 0 {
+        x1 += d.0;
+    }
+    if edges & TOP != 0 {
+        y0 += d.1;
+    }
+    if edges & BOTTOM != 0 {
+        y1 += d.1;
+    }
+    let cx = |v: f64| v.clamp(bounds.x, bounds.x + bounds.w);
+    let cy = |v: f64| v.clamp(bounds.y, bounds.y + bounds.h);
+    let mut r = R::from_points((cx(x0), cy(y0)), (cx(x1), cy(y1)));
+    if r.w < MIN_SEL {
+        r.w = MIN_SEL;
+        r.x = r.x.min(bounds.x + bounds.w - MIN_SEL);
+    }
+    if r.h < MIN_SEL {
+        r.h = MIN_SEL;
+        r.y = r.y.min(bounds.y + bounds.h - MIN_SEL);
+    }
+    r
+}
+
+/// `orig` moved by `d`, kept inside `bounds`.
+fn moved(orig: &R, d: (f64, f64), bounds: &R) -> R {
+    let x = (orig.x + d.0).clamp(bounds.x, (bounds.x + bounds.w - orig.w).max(bounds.x));
+    let y = (orig.y + d.1).clamp(bounds.y, (bounds.y + bounds.h - orig.h).max(bounds.y));
+    R { x, y, ..*orig }
+}
+
+const BTN_W: f64 = 96.0;
+const BTN_H: f64 = 30.0;
+const BAR_GAP: f64 = 6.0;
+const BAR_PAD: f64 = 4.0;
+
+/// The confirm bar beside the selection `sel`: its outline and the Cancel and
+/// Capture buttons. Below the selection, right-aligned; above it, or inside
+/// its corner, when the screen has no room below.
+fn bar_rects(sel: &R, bounds: &R) -> (R, [R; 2]) {
+    let w = 2.0 * BTN_W + BAR_GAP + 2.0 * BAR_PAD;
+    let h = BTN_H + 2.0 * BAR_PAD;
+    let (x0, y0) = (bounds.x + 4.0, bounds.y + 4.0);
+    let (x1, y1) = (bounds.x + bounds.w - 4.0, bounds.y + bounds.h - 4.0);
+    let below = sel.y + sel.h + 8.0;
+    let y = if below + h <= y1 {
+        below
+    } else if sel.y - 8.0 - h >= y0 {
+        sel.y - 8.0 - h
+    } else {
+        (sel.y + sel.h - h - 12.0).max(y0)
+    };
+    let x = (sel.x + sel.w - w).clamp(x0, (x1 - w).max(x0));
+    let btn = |i: f64| R { x: x + BAR_PAD + i * (BTN_W + BAR_GAP), y: y + BAR_PAD, w: BTN_W, h: BTN_H };
+    (R { x, y, w, h }, [btn(0.0), btn(1.0)])
+}
+
+/// Which part of the confirm bar is under `p`: 0 Cancel, 1 Capture, 2 the rest.
+fn bar_hit(sel: &R, bounds: &R, p: (f64, f64)) -> Option<u8> {
+    let (bar, btns) = bar_rects(sel, bounds);
+    if !bar.contains(p) {
+        return None;
+    }
+    Some(btns.iter().position(|b| b.contains(p)).map_or(2, |i| i as u8))
+}
+
+/// What a press at `p` does while adjusting: the confirm bar, else the selection.
+fn press_hit(a: &Adjust, bounds: &R, p: (f64, f64)) -> Hit {
+    match bar_hit(&a.sel, bounds, p) {
+        Some(i) => Hit::Bar(i),
+        None => hit_test(&a.sel, p),
+    }
+}
+
+/// The selection being adjusted after a drag.
+struct Adjust {
+    sel: R,
+    /// what the current drag does, with the selection as it was at its start
+    grab: Option<(Hit, R)>,
+    last_press: Option<(std::time::Instant, (f64, f64))>,
+    /// the current press is the second of a double click
+    double: bool,
+}
+
 struct State {
     img: ImageSurface,
     /// `img` with the dimming already applied (see `dimmed`)
@@ -69,6 +223,13 @@ struct State {
     has_cursor: bool,
     start: Option<(f64, f64)>,
     cur: (f64, f64),
+    /// a drag makes a selection that can be adjusted (off: capture on release)
+    adjustable: bool,
+    /// set once a drag has made a selection: it can then be adjusted
+    adjust: Option<Adjust>,
+    /// the current drag began outside an adjustable selection
+    restart: bool,
+    cursor_name: &'static str,
     done: bool,
 }
 
@@ -87,6 +248,9 @@ impl State {
     }
     /// What a release / Enter would capture right now (and what is drawn).
     fn active(&self) -> Option<R> {
+        if let Some(a) = &self.adjust {
+            return Some(a.sel);
+        }
         if self.picking_windows() {
             return if self.has_cursor { self.hover_window() } else { None };
         }
@@ -120,6 +284,7 @@ pub fn select(
     windows_px: Vec<(i32, i32, i32, i32)>,
     window_mode: bool,
     magnifier: bool,
+    adjust: bool,
     done: Done,
 ) {
     let mons = monitors();
@@ -149,6 +314,10 @@ pub fn select(
         has_cursor: false,
         start: None,
         cur: (0.0, 0.0),
+        adjustable: adjust,
+        adjust: None,
+        restart: false,
+        cursor_name: "crosshair",
         done: false,
     }));
     let done = Rc::new(RefCell::new(Some(done)));
@@ -158,6 +327,24 @@ pub fn select(
     let redraw = {
         let areas = areas.clone();
         move || areas.borrow().iter().for_each(|a| a.queue_draw())
+    };
+    // cursor shape: resize / move arrows over an adjustable selection
+    let set_cursor = {
+        let (st, areas) = (st.clone(), areas.clone());
+        move || {
+            let mut s = st.borrow_mut();
+            let name = match &s.adjust {
+                Some(a) if a.grab.is_some() => return,
+                Some(a) => cursor_for(press_hit(a, &s.virt, s.cursor)),
+                None => "crosshair",
+            };
+            if s.cursor_name == name {
+                return;
+            }
+            s.cursor_name = name;
+            drop(s);
+            areas.borrow().iter().for_each(|a| a.set_cursor_from_name(Some(name)));
+        }
     };
     // monitor-list watch, disconnected when the overlay is done
     let watch: Rc<RefCell<Option<(gtk::gio::ListModel, glib::SignalHandlerId)>>> = Rc::new(RefCell::new(None));
@@ -245,11 +432,13 @@ pub fn select(
         let track = {
             let st = st.clone();
             let redraw = redraw.clone();
+            let set_cursor = set_cursor.clone();
             move |x: f64, y: f64| {
                 let mut s = st.borrow_mut();
                 s.cursor = (g.x + x, g.y + y);
                 s.has_cursor = true;
                 drop(s);
+                set_cursor();
                 redraw();
             }
         };
@@ -270,10 +459,33 @@ pub fn select(
             drag.connect_drag_begin(move |_, x, y| {
                 let mut s = st.borrow_mut();
                 let p = (g.x + x, g.y + y);
-                s.start = Some(p);
-                s.cur = p;
                 s.cursor = p;
                 s.has_cursor = true;
+                let bounds = s.virt;
+                match s.adjust.as_ref().map(|a| press_hit(a, &bounds, p)) {
+                    // the first press of a drag: a new selection
+                    None => {
+                        s.start = Some(p);
+                        s.cur = p;
+                    }
+                    // pressed outside the one being adjusted: start over
+                    Some(Hit::New) => {
+                        s.adjust = None;
+                        s.restart = true;
+                        s.start = Some(p);
+                        s.cur = p;
+                    }
+                    Some(h) => {
+                        if let Some(a) = s.adjust.as_mut() {
+                            let double = a
+                                .last_press
+                                .is_some_and(|(t, q)| t.elapsed() < DOUBLE_CLICK && (q.0 - p.0).abs() <= 5.0 && (q.1 - p.1).abs() <= 5.0);
+                            a.last_press = Some((std::time::Instant::now(), p));
+                            a.double = double && !matches!(h, Hit::Bar(_));
+                            a.grab = Some((h, a.sel));
+                        }
+                    }
+                }
             });
         }
         {
@@ -282,8 +494,21 @@ pub fn select(
             drag.connect_drag_update(move |d, dx, dy| {
                 let mut s = st.borrow_mut();
                 if let Some((x, y)) = d.start_point() {
-                    s.cur = (g.x + x + dx, g.y + y + dy);
-                    s.cursor = s.cur;
+                    let p = (g.x + x + dx, g.y + y + dy);
+                    s.cursor = p;
+                    let bounds = s.virt;
+                    match s.adjust.as_mut() {
+                        Some(a) => {
+                            if let Some((hit, orig)) = a.grab {
+                                a.sel = match hit {
+                                    Hit::Move => moved(&orig, (dx, dy), &bounds),
+                                    Hit::Resize(e) => resized(&orig, e, (dx, dy), &bounds),
+                                    Hit::New | Hit::Bar(_) => a.sel,
+                                };
+                            }
+                        }
+                        None => s.cur = p,
+                    }
                 }
                 drop(s);
                 redraw();
@@ -293,14 +518,59 @@ pub fn select(
             let st = st.clone();
             let finish = finish.clone();
             let redraw = redraw.clone();
+            let set_cursor = set_cursor.clone();
             drag.connect_drag_end(move |_, _, _| {
+                let mut s = st.borrow_mut();
+                // end of moving or resizing the selection: a double click captures it
+                let (bounds, cursor) = (s.virt, s.cursor);
+                if let Some(a) = s.adjust.as_mut() {
+                    let grab = a.grab.take();
+                    let (double, sel) = (std::mem::take(&mut a.double), a.sel);
+                    drop(s);
+                    // a button counts when the press and the release are both on it
+                    let button = match grab {
+                        Some((Hit::Bar(i), _)) if bar_hit(&sel, &bounds, cursor) == Some(i) => Some(i),
+                        _ => None,
+                    };
+                    match button {
+                        Some(0) => finish(None),
+                        Some(1) => finish(Some(sel)),
+                        _ if double => finish(Some(sel)),
+                        _ => {
+                            set_cursor();
+                            redraw();
+                        }
+                    }
+                    return;
+                }
+                let restart = std::mem::take(&mut s.restart);
+                // a real drag (not a click on a window) leaves the selection
+                // open for adjusting
+                let dragged = s.selection().is_some() && !s.picking_windows();
                 // capture exactly what is highlighted (Space may have
                 // switched modes in the middle of the drag)
-                let a = st.borrow().active();
+                let a = s.active();
                 match a {
-                    Some(r) => finish(Some(r)),
+                    Some(r) if dragged && s.adjustable => {
+                        s.start = None;
+                        s.adjust = Some(Adjust { sel: r, grab: None, last_press: None, double: false });
+                        drop(s);
+                        set_cursor();
+                        redraw();
+                    }
+                    // a click outside the selection only drops it
+                    Some(_) | None if restart => {
+                        s.start = None;
+                        drop(s);
+                        redraw();
+                    }
+                    Some(r) => {
+                        drop(s);
+                        finish(Some(r));
+                    }
                     None => {
-                        st.borrow_mut().start = None;
+                        s.start = None;
+                        drop(s);
                         redraw();
                     }
                 }
@@ -324,6 +594,8 @@ pub fn select(
             keys.connect_key_pressed(move |_, key, _, _| {
                 match key {
                     gdk::Key::Escape => finish(None),
+                    // the selection is made: nothing to switch
+                    gdk::Key::space if st.borrow().adjust.is_some() => return glib::Propagation::Proceed,
                     gdk::Key::space => {
                         let mut s = st.borrow_mut();
                         s.window_mode = !s.window_mode;
@@ -432,7 +704,7 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
     let on_this = s.has_cursor && cx >= 0.0 && cy >= 0.0 && cx < w && cy < h;
 
     // crosshair
-    if on_this && s.start.is_none() && !s.picking_windows() {
+    if on_this && s.start.is_none() && s.adjust.is_none() && !s.picking_windows() {
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
         cr.set_line_width(1.0);
         cr.move_to(0.0, cy.floor() + 0.5);
@@ -451,11 +723,17 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
         // above the selection, or just inside it when it touches the top edge
         let ly = if r.y - 26.0 >= 2.0 { r.y - 26.0 } else { (r.y + 6.0).max(2.0) };
         label(cr, &format!("{} × {}", px.2, px.3), r.x.max(0.0) + if ly > r.y { 6.0 } else { 0.0 }, ly, w);
+        if let Some(a) = &s.adjust {
+            handles(cr, &r);
+            confirm_bar(cr, &a.sel, s, g);
+        }
     }
 
     // help text: bottom left, moved to the top when it would cover the
     // selection or the pointer
-    let help = if s.picking_windows() {
+    let help = if s.adjust.is_some() {
+        "Drag the edges to adjust · drag inside to move · Enter: capture · Esc: cancel"
+    } else if s.picking_windows() {
         "Window mode · click a window · Space: region mode · Esc: cancel"
     } else if s.windows.is_empty() {
         "Drag to select · Esc: cancel"
@@ -473,8 +751,75 @@ fn draw(s: &State, cr: &cairo::Context, g: R, w: f64, h: f64) {
         label(cr, help, 12.0, y, w);
     }
 
-    if on_this && s.magnifier {
+    // not over the confirm bar: the magnifier would cover its buttons
+    let over_bar = s.adjust.as_ref().is_some_and(|a| bar_hit(&a.sel, &s.virt, s.cursor).is_some());
+    if on_this && s.magnifier && !over_bar {
         magnifier(s, cr, cx, cy, w, h);
+    }
+}
+
+/// The Cancel / Capture buttons beside the selection.
+fn confirm_bar(cr: &cairo::Context, sel: &R, s: &State, g: R) {
+    let (bar, btns) = bar_rects(sel, &s.virt);
+    let off = |r: &R| R { x: r.x - g.x, y: r.y - g.y, ..*r };
+    let bar = off(&bar);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.8);
+    rounded(cr, bar.x, bar.y, bar.w, bar.h, 9.0);
+    cr.fill().ok();
+    let hover = bar_hit(sel, &s.virt, s.cursor).filter(|&i| i < 2);
+    for (i, b) in btns.iter().enumerate() {
+        let b = off(b);
+        let hot = hover == Some(i as u8);
+        if i == 1 {
+            // Capture: the confirming action
+            cr.set_source_rgb(if hot { 0.22 } else { 0.17 }, if hot { 0.80 } else { 0.71 }, if hot { 0.52 } else { 0.45 });
+        } else {
+            cr.set_source_rgba(1.0, 1.0, 1.0, if hot { 0.28 } else { 0.14 });
+        }
+        rounded(cr, b.x, b.y, b.w, b.h, 6.0);
+        cr.fill().ok();
+        // icon, then text
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.set_line_width(2.0);
+        cr.set_line_cap(cairo::LineCap::Round);
+        cr.set_line_join(cairo::LineJoin::Round);
+        let (ix, iy) = (b.x + 14.0, b.y + b.h / 2.0);
+        if i == 1 {
+            cr.move_to(ix - 5.0, iy + 0.5);
+            cr.line_to(ix - 1.5, iy + 4.0);
+            cr.line_to(ix + 5.5, iy - 4.0);
+        } else {
+            cr.move_to(ix - 4.0, iy - 4.0);
+            cr.line_to(ix + 4.0, iy + 4.0);
+            cr.move_to(ix + 4.0, iy - 4.0);
+            cr.line_to(ix - 4.0, iy + 4.0);
+        }
+        cr.stroke().ok();
+        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        cr.set_font_size(13.0);
+        cr.move_to(b.x + 28.0, b.y + b.h / 2.0 + 4.5);
+        cr.show_text(if i == 1 { "Capture" } else { "Cancel" }).ok();
+    }
+}
+
+/// Square grips on the corners and, when there is room, edge midpoints.
+fn handles(cr: &cairo::Context, r: &R) {
+    let (x1, y1) = (r.x + r.w, r.y + r.h);
+    let (mx, my) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+    let mut pts = vec![(r.x, r.y), (x1, r.y), (x1, y1), (r.x, y1)];
+    if r.w >= 48.0 {
+        pts.extend([(mx, r.y), (mx, y1)]);
+    }
+    if r.h >= 48.0 {
+        pts.extend([(r.x, my), (x1, my)]);
+    }
+    cr.set_line_width(1.5);
+    for (x, y) in pts {
+        cr.rectangle(x - 4.0, y - 4.0, 8.0, 8.0);
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.fill_preserve().ok();
+        cr.set_source_rgb(0.17, 0.71, 0.45);
+        cr.stroke().ok();
     }
 }
 
@@ -576,4 +921,103 @@ fn magnifier(s: &State, cr: &cairo::Context, cx: f64, cy: f64, w: f64, h: f64) {
         });
     }
     label(cr, &format!("{}, {}{}", ix as i64, iy as i64, rgb), bx, by + SIZE + 4.0, w);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEL: R = R { x: 100.0, y: 100.0, w: 200.0, h: 100.0 };
+    const BOUNDS: R = R { x: 0.0, y: 0.0, w: 1000.0, h: 800.0 };
+
+    #[test]
+    fn presses_grab_edges_corners_inside_or_outside() {
+        assert_eq!(hit_test(&SEL, (200.0, 150.0)), Hit::Move);
+        assert_eq!(hit_test(&SEL, (100.0, 150.0)), Hit::Resize(LEFT));
+        assert_eq!(hit_test(&SEL, (300.0, 150.0)), Hit::Resize(RIGHT));
+        assert_eq!(hit_test(&SEL, (200.0, 100.0)), Hit::Resize(TOP));
+        assert_eq!(hit_test(&SEL, (200.0, 200.0)), Hit::Resize(BOTTOM));
+        assert_eq!(hit_test(&SEL, (100.0, 100.0)), Hit::Resize(LEFT | TOP));
+        assert_eq!(hit_test(&SEL, (300.0, 200.0)), Hit::Resize(RIGHT | BOTTOM));
+        assert_eq!(hit_test(&SEL, (300.0, 100.0)), Hit::Resize(RIGHT | TOP));
+        assert_eq!(hit_test(&SEL, (100.0, 200.0)), Hit::Resize(LEFT | BOTTOM));
+        // the grip reaches a little outside the edge, but not far
+        assert_eq!(hit_test(&SEL, (94.0, 150.0)), Hit::Resize(LEFT));
+        assert_eq!(hit_test(&SEL, (60.0, 150.0)), Hit::New);
+        assert_eq!(hit_test(&SEL, (500.0, 500.0)), Hit::New);
+        // a tiny selection still has an inside to move it by
+        let tiny = R { x: 100.0, y: 100.0, w: 30.0, h: 30.0 };
+        assert_eq!(hit_test(&tiny, (115.0, 115.0)), Hit::Move);
+    }
+
+    #[test]
+    fn confirm_bar_sits_below_above_or_inside() {
+        let (bar, [cancel, capture]) = bar_rects(&SEL, &BOUNDS);
+        // below, right-aligned with the selection, Capture at the corner
+        assert!(bar.y > SEL.y + SEL.h);
+        assert_eq!(bar.x + bar.w, SEL.x + SEL.w);
+        assert!(capture.x > cancel.x && capture.x + capture.w <= bar.x + bar.w);
+        // no room below: above
+        let low = R { y: 700.0, ..SEL };
+        assert!(bar_rects(&low, &BOUNDS).0.y + bar.h < low.y);
+        // whole screen: inside the selection's bottom-right
+        let full = R { x: 0.0, y: 0.0, w: 1000.0, h: 800.0 };
+        let inside = bar_rects(&full, &BOUNDS).0;
+        assert!(inside.y + inside.h <= 800.0 && inside.x + inside.w <= 1000.0 && inside.y >= 0.0);
+        // a narrow selection near the left edge keeps the bar on screen
+        let thin = R { x: 2.0, y: 100.0, w: 20.0, h: 50.0 };
+        assert!(bar_rects(&thin, &BOUNDS).0.x >= 0.0);
+    }
+
+    #[test]
+    fn bar_presses_pick_a_button() {
+        let (bar, [cancel, capture]) = bar_rects(&SEL, &BOUNDS);
+        let mid = |r: &R| (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        assert_eq!(bar_hit(&SEL, &BOUNDS, mid(&cancel)), Some(0));
+        assert_eq!(bar_hit(&SEL, &BOUNDS, mid(&capture)), Some(1));
+        // the padding is part of the bar but does nothing
+        assert_eq!(bar_hit(&SEL, &BOUNDS, (bar.x + 1.0, bar.y + 1.0)), Some(2));
+        assert_eq!(bar_hit(&SEL, &BOUNDS, (SEL.x + 5.0, SEL.y + 5.0)), None);
+        let a = Adjust { sel: SEL, grab: None, last_press: None, double: false };
+        assert_eq!(press_hit(&a, &BOUNDS, mid(&capture)), Hit::Bar(1));
+        assert_eq!(press_hit(&a, &BOUNDS, (200.0, 150.0)), Hit::Move);
+    }
+
+    #[test]
+    fn cursors_match_the_grab() {
+        assert_eq!(cursor_for(Hit::New), "crosshair");
+        assert_eq!(cursor_for(Hit::Move), "move");
+        assert_eq!(cursor_for(Hit::Resize(LEFT)), "ew-resize");
+        assert_eq!(cursor_for(Hit::Resize(BOTTOM)), "ns-resize");
+        assert_eq!(cursor_for(Hit::Resize(LEFT | TOP)), "nwse-resize");
+        assert_eq!(cursor_for(Hit::Resize(RIGHT | BOTTOM)), "nwse-resize");
+        assert_eq!(cursor_for(Hit::Resize(RIGHT | TOP)), "nesw-resize");
+        assert_eq!(cursor_for(Hit::Resize(LEFT | BOTTOM)), "nesw-resize");
+    }
+
+    #[test]
+    fn resizing_moves_only_the_grabbed_edges() {
+        let r = resized(&SEL, RIGHT | BOTTOM, (50.0, 20.0), &BOUNDS);
+        assert_eq!(r, R { x: 100.0, y: 100.0, w: 250.0, h: 120.0 });
+        let r = resized(&SEL, LEFT, (-40.0, 99.0), &BOUNDS);
+        assert_eq!(r, R { x: 60.0, y: 100.0, w: 240.0, h: 100.0 });
+        // dragging an edge past the opposite one flips the rectangle
+        let r = resized(&SEL, LEFT, (250.0, 0.0), &BOUNDS);
+        assert_eq!(r, R { x: 300.0, y: 100.0, w: 50.0, h: 100.0 });
+        // stays on screen
+        let r = resized(&SEL, RIGHT | BOTTOM, (5000.0, 5000.0), &BOUNDS);
+        assert_eq!((r.x + r.w, r.y + r.h), (1000.0, 800.0));
+        // never collapses
+        let r = resized(&SEL, LEFT, (200.0, 0.0), &BOUNDS);
+        assert!(r.w >= MIN_SEL);
+    }
+
+    #[test]
+    fn moving_keeps_the_size_and_stays_on_screen() {
+        assert_eq!(moved(&SEL, (30.0, -20.0), &BOUNDS), R { x: 130.0, y: 80.0, ..SEL });
+        let r = moved(&SEL, (-500.0, -500.0), &BOUNDS);
+        assert_eq!((r.x, r.y, r.w, r.h), (0.0, 0.0, 200.0, 100.0));
+        let r = moved(&SEL, (5000.0, 5000.0), &BOUNDS);
+        assert_eq!((r.x + r.w, r.y + r.h), (1000.0, 800.0));
+    }
 }

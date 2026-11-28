@@ -23,6 +23,9 @@ pub struct Config {
     pub after_capture: AfterCapture,
     pub notifications: bool,
     pub magnifier: bool,
+    /// after dragging a region it can be resized / moved and is confirmed
+    /// with Enter or the buttons, instead of being captured on release
+    pub adjust_selection: bool,
     pub hotkeys: bool,
     pub last_region: Option<[i32; 4]>,
     pub line_color: [f64; 4],
@@ -53,6 +56,7 @@ impl Default for Config {
             after_capture: AfterCapture::Editor,
             notifications: true,
             magnifier: true,
+            adjust_selection: true,
             hotkeys: true,
             last_region: None,
             line_color: [0.937, 0.267, 0.267, 1.0],
