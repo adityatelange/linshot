@@ -72,7 +72,13 @@ jobs:
           - {image: "opensuse/tumbleweed", arch: arm64, runner: ubuntu-22.04-arm, install: "zypper --non-interactive install --allow-unsigned-rpm"}
     name: rpm-check (${{ matrix.image }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.image }}
+    # The openSUSE image declares no PATH. The runner builds the steps' PATH from
+    # the container's, so without one it ends up as only the directories actions
+    # add (~/.cargo/bin) and `bash` can no longer be found.
+    container:
+      image: ${{ matrix.image }}
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - uses: actions/download-artifact@v8
         with:
