@@ -95,6 +95,7 @@ h2 { font-size: clamp(24px, 3.4vw, 32px); letter-spacing: -.01em; margin: 0 0 8p
 .lead { color: var(--muted); margin: 0 0 28px; }
 
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+@media (min-width: 820px) { .grid.features { grid-template-columns: repeat(3, 1fr); } }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
 .card h3 { margin: 0 0 6px; font-size: 17px; }
 .card p { margin: 0; color: var(--muted); font-size: 15px; }
@@ -156,12 +157,15 @@ footer { padding: 56px 0 40px; color: var(--muted); font-size: 14px; text-align:
     <section id="features" aria-labelledby="features-h">
       <h2 id="features-h">Features</h2>
       <p class="lead">Everything for a quick, clear screenshot, nothing in the way.</p>
-      <div class="grid">
+      <div class="grid features">
         <div class="card"><h3>Every capture mode</h3><p>Region, window, active window, full screen across monitors, last region, and delayed capture with a visible countdown.</p></div>
-        <div class="card"><h3>Precise selection</h3><p>Frozen screen, crosshair and pixel magnifier with colour readout. Adjust the selection after dragging, or click a window to snap to it.</p></div>
+        <div class="card"><h3>Precise selection</h3><p>Frozen screen, crosshair and pixel magnifier with colour readout. Click a window to snap to it.</p></div>
+        <div class="card"><h3>Adjust before you capture</h3><p>Drag the edges or corners to resize, drag inside to move, nudge with the arrow keys. Enter or the Capture button takes it; Ctrl+C copies it without opening the editor.</p></div>
         <div class="card"><h3>Annotation editor</h3><p>Rectangle, ellipse, line, arrow, freehand, text, highlighter, numbered steps and crop, with undo and zoom.</p></div>
         <div class="card"><h3>Hide what matters</h3><p>Pixelate or blur passwords, tokens and personal data before sharing.</p></div>
         <div class="card"><h3>Movable mouse pointer</h3><p>The pointer is captured as its own object: move it or delete it after the shot.</p></div>
+        <div class="card"><h3>Made for scripts</h3><p><code>linshot region -o shot.png</code> waits for the file and exits non-zero if the capture fails or is cancelled. Delay, clipboard and save flags included.</p></div>
+        <div class="card"><h3>Private by design</h3><p>No uploads, no accounts, no telemetry. Screenshots stay on your machine until you share them.</p></div>
         <div class="card"><h3>Fits your desktop</h3><p>Follows light/dark mode and your accent colour, sits in the tray, and registers the Print key for you.</p></div>
       </div>
     </section>
