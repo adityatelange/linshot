@@ -45,6 +45,8 @@ list.ls-group > row:last-child { border-bottom-left-radius: 12px; border-bottom-
 .ls-row { padding: 10px 14px; min-height: 34px; }
 .ls-row-title { font-weight: 500; }
 .ls-row-sub { color: @ls_muted; font-size: 0.85em; }
+.ls-value { color: @ls_muted; }
+.ls-link, .ls-link label { color: @ls_accent; padding: 0; min-height: 0; }
 list.ls-group switch:checked { background: @ls_accent; }
 list.ls-group switch:checked slider { background: #ffffff; }
 .ls-width-dot { margin: 0 2px; }

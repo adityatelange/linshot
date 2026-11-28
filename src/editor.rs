@@ -833,6 +833,9 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     sec2.append(Some("New capture"), Some("win.capture"));
     sec2.append(Some("Preferences"), Some("win.prefs"));
     menu.append_section(None, &sec2);
+    let sec3 = gio::Menu::new();
+    sec3.append(Some("Linshot on GitHub"), Some("win.github"));
+    menu.append_section(None, &sec3);
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .menu_model(&menu)
@@ -1223,6 +1226,11 @@ pub fn open(ctx: &Rc<Ctx>, img: ImageSurface, title: Option<String>, pointer: Op
     }));
     add_action("prefs", Box::new(|e| {
         let _ = e.ctx.tx.send_blocking(crate::Cmd::Settings);
+    }));
+    add_action("github", Box::new(|e| {
+        if let Err(err) = gio::AppInfo::launch_default_for_uri(crate::about::WEBSITE, gio::AppLaunchContext::NONE) {
+            e.ctx.error(Some(e.ui.win.upcast_ref()), &format!("Could not open {}: {err}", crate::about::WEBSITE));
+        }
     }));
     for (b, f) in [(&zoom_in, 1.25), (&zoom_out, 0.8)] {
         let w = Rc::downgrade(&e);

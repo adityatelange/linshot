@@ -226,6 +226,25 @@ pub fn show(ctx: &Rc<Ctx>) {
     let (auto, _) = g.switch("Start at login", Some("Keeps the tray icon and shortcuts ready"), config::autostart_path().exists());
     page.append(&g.root);
 
+    // ------------------------------------------------------------ about
+    let g = Group::new("About");
+    let value = |text: &str| {
+        let l = gtk::Label::new(Some(text));
+        l.add_css_class("ls-value");
+        l.set_selectable(true);
+        l
+    };
+    let link = |label: &str, uri: &str| {
+        let b = gtk::LinkButton::with_label(uri, label);
+        b.add_css_class("ls-link");
+        b
+    };
+    g.row("Version", None, &value(crate::VERSION));
+    g.row("Author", None, &value(crate::about::AUTHOR));
+    g.row("License", Some("Free software: you may share and change it"), &link(crate::about::LICENSE, crate::about::LICENSE_URL));
+    g.row("Source code", Some("Report problems and read the code"), &link(crate::about::WEBSITE_LABEL, crate::about::WEBSITE));
+    page.append(&g.root);
+
     let clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
     clamp.set_halign(gtk::Align::Center);
     clamp.set_size_request(480, -1);
