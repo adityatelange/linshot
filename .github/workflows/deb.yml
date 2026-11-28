@@ -57,20 +57,22 @@ jobs:
             dist/*.deb
             dist/*.rpm
 
-  # The .rpm must install on a real RPM distribution: its dependencies
-  # (shared libraries) have to resolve there. Blocks the release otherwise.
+  # The .rpm must install on real RPM distributions, both architectures: its
+  # dependencies (shared libraries) have to resolve there. Blocks the release
+  # otherwise.
   rpm-check:
     needs: deb
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            arch: amd64
-          - runner: ubuntu-22.04-arm
-            arch: arm64
+          - {image: "fedora:latest", arch: amd64, runner: ubuntu-latest, install: "dnf install -y"}
+          - {image: "fedora:latest", arch: arm64, runner: ubuntu-22.04-arm, install: "dnf install -y"}
+          - {image: "opensuse/tumbleweed", arch: amd64, runner: ubuntu-latest, install: "zypper --non-interactive install --allow-unsigned-rpm"}
+          - {image: "opensuse/tumbleweed", arch: arm64, runner: ubuntu-22.04-arm, install: "zypper --non-interactive install --allow-unsigned-rpm"}
+    name: rpm-check (${{ matrix.image }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    container: fedora:latest
+    container: ${{ matrix.image }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -78,7 +80,7 @@ jobs:
           path: dist
       - name: Install the package and its dependencies
         run: |
-          dnf install -y ./dist/*.rpm
+          ${{ matrix.install }} ./dist/*.rpm
           linshot --version
           rpm -q --requires linshot | grep -c 'libgtk-4'
           rpm -V linshot

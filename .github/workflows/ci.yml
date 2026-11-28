@@ -34,3 +34,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # builds the whole program (in test mode) and runs the tests
       - run: cargo test --locked
+
+  # The same on RPM distributions, with their own GTK / glibc: Fedora (current
+  # GTK) and openSUSE Tumbleweed. The .rpm itself is built on Ubuntu, so this is
+  # what shows that Linshot compiles and passes its tests against their libraries.
+  test-rpm:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: fedora:latest
+            setup: dnf install -y gcc git curl tar gzip pkgconf-pkg-config gtk4-devel dbus-devel
+          - image: opensuse/tumbleweed
+            setup: zypper --non-interactive install gcc git curl tar gzip pkg-config gtk4-devel dbus-1-devel
+    name: test (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    env:
+      RUSTFLAGS: -D warnings
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - run: ${{ matrix.setup }}
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
