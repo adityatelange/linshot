@@ -29,13 +29,24 @@ Website: https://adityatelange.github.io/linshot/
 
 ## Install
 
+Debian, Ubuntu, Linux Mint and derivatives:
+
 ```bash
-sudo apt install ./dist/linshot_0.3.0_amd64.deb
+sudo apt install ./linshot_0.3.0_amd64.deb
 ```
 
+Fedora, openSUSE and other RPM-based distributions:
+
+```bash
+sudo dnf install ./linshot-0.3.0-1.x86_64.rpm      # openSUSE: sudo zypper install ./linshot-0.3.0-1.x86_64.rpm
+```
+
+Packages for amd64 / x86_64 and arm64 / aarch64 are on the
+[releases page](https://github.com/adityatelange/linshot/releases).
+
 Requires GTK ≥ 4.6 and glibc ≥ 2.35: Ubuntu 22.04+, Debian 12+, Linux Mint 21+, Pop!_OS 22.04+,
-or newer derivatives. Use the `.deb` built for the oldest release you run (the 22.04 build also
-installs on 24.04 and Debian 12/13).
+Fedora 36+ or newer derivatives. Both packages are built on Ubuntu 22.04 (the 22.04 build also
+installs on 24.04 and Debian 12/13); CI test-installs the `.rpm` on current Fedora.
 
 ## Keyboard shortcuts
 
@@ -85,11 +96,12 @@ installed (desktops only accept clipboard data from a focused window).
 sudo apt install libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
 curl https://sh.rustup.rs -sSf | sh   # Rust ≥ 1.88; distro cargo is too old on 22.04/Debian 12
 packaging/build-deb.sh          # -> dist/linshot_<version>_<arch>.deb
+packaging/build-rpm.sh          # -> dist/linshot-<version>-1.<arch>.rpm (needs rpmbuild)
 ```
 
-The `.deb` targets the architecture it is built on and every release at least as new as the build
-host. CI builds amd64 and arm64 packages on Ubuntu 22.04, which install on Ubuntu 22.04+ and
-Debian 12+.
+The packages target the architecture they are built on and every release at least as new as the
+build host. CI builds amd64 and arm64 packages on Ubuntu 22.04, which install on Ubuntu 22.04+,
+Debian 12+ and Fedora 36+.
 
 ## License
 
@@ -99,5 +111,5 @@ Linshot is free software: you can redistribute it and/or modify it under the ter
 GNU General Public License as published by the Free Software Foundation, either version 3 of
 the License, or (at your option) any later version. See [LICENSE](LICENSE).
 
-The `.deb` packages also include the licenses of the bundled Rust crates in
+The `.deb` and `.rpm` packages also include the licenses of the bundled Rust crates in
 `/usr/share/doc/linshot/THIRD-PARTY-LICENSES.gz`.

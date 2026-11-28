@@ -1,4 +1,4 @@
-name: Build .deb
+name: Build packages (.deb, .rpm)
 
 on:
   push:
@@ -14,7 +14,8 @@ jobs:
     # Built on the oldest supported release: the package's glibc/GTK
     # requirements come from the build host, and the Ubuntu 22.04 build
     # (glibc 2.35, GTK 4.6) installs on Ubuntu 22.04+, Debian 12+, Mint 21+
-    # and other derivatives.
+    # and other derivatives. The .rpm is packaged from the same binary and
+    # needs the same glibc / GTK (Fedora 36+, openSUSE and the like).
     strategy:
       fail-fast: false
       matrix:
@@ -38,11 +39,13 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v (bump it first)"
             exit 1
           fi
-      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libdbus-1-dev pkg-config dpkg-dev rpm
       - uses: dtolnay/rust-toolchain@stable
       # reuses compiled dependencies between runs (tests run in ci.yml)
       - uses: Swatinem/rust-cache@v2
       - run: packaging/build-deb.sh
+      # same compiled binary, so this adds only the packaging step
+      - run: packaging/build-rpm.sh
       - name: Check the package installs
         run: |
           sudo apt-get install -y ./dist/*.deb
@@ -50,12 +53,40 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linshot-${{ matrix.distro }}-${{ matrix.arch }}
-          path: dist/*.deb
+          path: |
+            dist/*.deb
+            dist/*.rpm
+
+  # The .rpm must install on a real RPM distribution: its dependencies
+  # (shared libraries) have to resolve there. Blocks the release otherwise.
+  rpm-check:
+    needs: deb
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    container: fedora:latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linshot-ubuntu22.04-${{ matrix.arch }}
+          path: dist
+      - name: Install the package and its dependencies
+        run: |
+          dnf install -y ./dist/*.rpm
+          linshot --version
+          rpm -q --requires linshot | grep -c 'libgtk-4'
+          rpm -V linshot
 
   # On a version tag (v*), publish a GitHub release with the packages from
   # every build above plus SHA256 checksums. Manual runs only build.
   release:
-    needs: deb
+    needs: [deb, rpm-check]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -64,7 +95,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum *.deb > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum *.deb *.rpm > SHA256SUMS && cat SHA256SUMS
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
